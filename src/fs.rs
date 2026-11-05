@@ -6,7 +6,6 @@ use crate::checksum::Checksummer;
 use crate::error::{Error, Result};
 use crate::features;
 use crate::inode::Inode;
-use crate::mkfs::group_has_super;
 use crate::superblock::Superblock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -767,7 +766,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.live_groups(None)?,
             need_blocks,
             inode_group,
             &mut bitmap_reader,
@@ -1165,17 +1164,13 @@ impl Filesystem {
         let bm = buf.get_mut(self, bitmap_block)?;
         if was_uninit {
             bm.iter_mut().for_each(|byte| *byte = 0);
-            if group_has_super(gi as u64) {
-                let desc_size = self.sb.desc_size as u64;
-                let bs = self.sb.block_size() as u64;
-                let gdt_blocks = (self.groups.len() as u64 * desc_size).div_ceil(bs);
-                let reserved = 1 + gdt_blocks; // superblock backup + GDT backup
-                for bit in 0..reserved.min(bpg) {
-                    let byte = (bit / 8) as usize;
-                    let mask = 1u8 << (bit % 8);
-                    if byte < bm.len() {
-                        bm[byte] |= mask;
-                    }
+            // Superblock backup + GDT copy + reserved GDT blocks.
+            let reserved = self.sb.group_head_overhead(gi as u64);
+            for bit in 0..reserved.min(bpg) {
+                let byte = (bit / 8) as usize;
+                let mask = 1u8 << (bit % 8);
+                if byte < bm.len() {
+                    bm[byte] |= mask;
                 }
             }
         }
@@ -1370,6 +1365,46 @@ impl Filesystem {
             }
         }
         Ok(())
+    }
+
+    /// The block group descriptors as they stand now, for the allocators:
+    /// the descriptor table read back through the device (which sees
+    /// committed transactions, journaled or not), with the blocks `buf` has
+    /// staged but not committed yet laid over it.
+    ///
+    /// `self.groups` is the mount-time snapshot: its `BLOCK_UNINIT` /
+    /// `INODE_UNINIT` flags and free counts go stale with the first
+    /// allocation into a group. An allocator fed the snapshot keeps
+    /// treating that group's bitmap as all-free and hands out its "first
+    /// free" blocks (or inode) again — to the next sub-run of the same
+    /// `apply_pwrite`, to the extent-tree node of that write, or to the
+    /// next file in the same mount. Only the allocation-relevant fields can
+    /// go stale (bitmap / inode-table locations never move), so the
+    /// snapshot stays valid for everything else.
+    pub(crate) fn live_groups(
+        &self,
+        buf: Option<&BlockBuffer>,
+    ) -> Result<Vec<BlockGroupDescriptor>> {
+        let bs = self.sb.block_size() as usize;
+        let desc_size = self.sb.desc_size as usize;
+        let bgt_first_block = self.sb.first_data_block as u64 + 1;
+        let ngroups = self.groups.len();
+        let bgt_blocks = (ngroups * desc_size).div_ceil(bs);
+
+        let mut table = Vec::with_capacity(bgt_blocks * bs);
+        for i in 0..bgt_blocks as u64 {
+            let block = bgt_first_block + i;
+            match buf.and_then(|b| b.dirty.get(&block)) {
+                Some(bytes) => table.extend_from_slice(bytes),
+                None => table.extend_from_slice(&self.read_block(block)?),
+            }
+        }
+        (0..ngroups)
+            .map(|gi| {
+                let off = gi * desc_size;
+                BlockGroupDescriptor::parse(&table[off..off + desc_size], self.sb.desc_size)
+            })
+            .collect()
     }
 
     /// Buffer-side BGD counter patch. Mirrors `patch_bgd_counters` byte
@@ -1934,7 +1969,7 @@ impl Filesystem {
         let inode_group = (ino - 1) / self.sb.inodes_per_group;
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.live_groups(None)?,
             1,
             inode_group,
             &mut bitmap_reader,
@@ -2234,7 +2269,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_inode_allocation(
             &self.sb,
-            &self.groups,
+            &self.live_groups(None)?,
             false,
             parent_group,
             &mut bitmap_reader,
@@ -2484,7 +2519,7 @@ impl Filesystem {
             let mut bitmap_reader = |block: u64| self.read_block(block);
             let bplan = crate::alloc::plan_block_allocation(
                 &self.sb,
-                &self.groups,
+                &self.live_groups(None)?,
                 1,
                 parent_group,
                 &mut bitmap_reader,
@@ -2735,7 +2770,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.live_groups(None)?,
             needed_blocks,
             group_idx_of_inode as u32,
             &mut bitmap_reader,
@@ -2856,7 +2891,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.live_groups(None)?,
             total_run,
             group_idx_of_inode as u32,
             &mut bitmap_reader,
@@ -3087,7 +3122,7 @@ impl Filesystem {
                         };
                         crate::alloc::plan_block_allocation(
                             &self.sb,
-                            &self.groups,
+                            &self.live_groups(Some(&buf))?,
                             want,
                             group_idx_of_inode,
                             &mut bitmap_reader,
@@ -3172,7 +3207,7 @@ impl Filesystem {
                                     };
                                     crate::alloc::plan_block_allocation(
                                         &self.sb,
-                                        &self.groups,
+                                        &self.live_groups(Some(&buf))?,
                                         1,
                                         group_idx_of_inode,
                                         &mut bitmap_reader,
@@ -3774,7 +3809,7 @@ impl Filesystem {
         // 1. Allocate inode (is_dir = true so Orlov picks a dir-friendly group).
         let iplan = crate::alloc::plan_inode_allocation(
             &self.sb,
-            &self.groups,
+            &self.live_groups(None)?,
             true,
             parent_group,
             &mut bitmap_reader,
@@ -3784,7 +3819,7 @@ impl Filesystem {
         // 2. Allocate one data block for the dir contents.
         let bplan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.live_groups(None)?,
             1,
             iplan.bgd.group_idx,
             &mut bitmap_reader,
@@ -4414,7 +4449,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.live_groups(None)?,
             1,
             parent_group,
             &mut bitmap_reader,
@@ -4492,7 +4527,7 @@ impl Filesystem {
                     };
                     let meta_plan = crate::alloc::plan_block_allocation(
                         &self.sb,
-                        &self.groups,
+                        &self.live_groups(None)?,
                         1,
                         parent_group,
                         &mut reader2,
@@ -4628,7 +4663,7 @@ impl Filesystem {
             };
             let meta_plan = crate::alloc::plan_block_allocation(
                 &self.sb,
-                &self.groups,
+                &self.live_groups(None)?,
                 1,
                 parent_group,
                 &mut bm_reader,

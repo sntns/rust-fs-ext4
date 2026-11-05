@@ -235,7 +235,14 @@ where
         let max_bits = blocks_in_group(sb, gi);
 
         let bitmap_bytes: Vec<u8> = if bgd.flags().contains(BgdFlags::BLOCK_UNINIT) {
-            vec![0u8; sb.block_size() as usize]
+            // Never read: all free, but for the superblock / GDT backups
+            // at the group's head, which the on-disk bitmap would mark.
+            let mut bm = vec![0u8; sb.block_size() as usize];
+            let overhead = sb.group_head_overhead(gi as u64).min(max_bits as u64);
+            for bit in 0..overhead as usize {
+                bm[bit / 8] |= 1 << (bit % 8);
+            }
+            bm
         } else {
             bitmap_reader(bgd.block_bitmap)?
         };

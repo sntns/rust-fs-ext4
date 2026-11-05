@@ -62,6 +62,16 @@ pub struct Superblock {
     /// in another machine?").
     pub last_mounted: String,
     pub desc_size: u16, // BGD size: 32 or 64
+    /// `s_reserved_gdt_blocks` (0xCE). GDT blocks reserved after each GDT
+    /// copy for online resize (`resize_inode`); they live in every group
+    /// that carries a superblock backup.
+    pub reserved_gdt_blocks: u16,
+    /// `s_first_meta_bg` (0x104). With `INCOMPAT_META_BG`, the groups of the
+    /// first `first_meta_bg` meta-groups keep the classic GDT layout.
+    pub first_meta_bg: u32,
+    /// `s_backup_bgs` (0x24C). With `COMPAT_SPARSE_SUPER2`, the only two
+    /// groups (besides group 0) carrying a superblock backup; 0 = none.
+    pub backup_bgs: [u32; 2],
     pub hash_seed: [u32; 4],
     pub default_hash_version: u8,
     pub checksum_seed: u32, // s_checksum_seed (used when INCOMPAT_CSUM_SEED)
@@ -191,6 +201,12 @@ impl Superblock {
         let desc_size = u16::from_le_bytes(raw[0xFE..0x100].try_into().unwrap());
         // If desc_size is 0, default to 32 (legacy); spec says 32 or 64
         let desc_size = if desc_size == 0 { 32 } else { desc_size };
+        let reserved_gdt_blocks = u16::from_le_bytes(raw[0xCE..0xD0].try_into().unwrap());
+        let first_meta_bg = u32::from_le_bytes(raw[0x104..0x108].try_into().unwrap());
+        let backup_bgs = [
+            u32::from_le_bytes(raw[0x24C..0x250].try_into().unwrap()),
+            u32::from_le_bytes(raw[0x250..0x254].try_into().unwrap()),
+        ];
 
         let mut hash_seed = [0u32; 4];
         for (i, slot) in hash_seed.iter_mut().enumerate() {
@@ -263,6 +279,9 @@ impl Superblock {
             volume_name,
             last_mounted,
             desc_size,
+            reserved_gdt_blocks,
+            first_meta_bg,
+            backup_bgs,
             hash_seed,
             default_hash_version,
             checksum_seed,
@@ -294,6 +313,68 @@ impl Superblock {
     /// Block size in bytes: 1024 << log_block_size.
     pub fn block_size(&self) -> u32 {
         1024u32 << self.log_block_size
+    }
+
+    /// Whether group `g` carries a superblock backup (group 0: the primary).
+    /// Mirrors e2fsprogs' `ext2fs_bg_has_super`.
+    pub fn group_has_super(&self, g: u64) -> bool {
+        use crate::features::{Compat, RoCompat};
+        if g == 0 {
+            return true;
+        }
+        if self.feature_compat & Compat::SPARSE_SUPER2.bits() != 0 {
+            return self.backup_bgs.iter().any(|&b| b != 0 && b as u64 == g);
+        }
+        if self.feature_ro_compat & RoCompat::SPARSE_SUPER.bits() == 0 {
+            return true;
+        }
+        crate::mkfs::group_has_super(g)
+    }
+
+    /// Number of GDT blocks (not counting reserved ones) stored in group
+    /// `g`. Mirrors e2fsprogs' `ext2fs_bg_num_gdb`.
+    pub fn group_num_gdt_blocks(&self, g: u64) -> u64 {
+        use crate::features::Incompat;
+        let descs_per_block = (self.block_size() / self.desc_size as u32) as u64;
+        let meta_bg = g / descs_per_block;
+        let has_meta_bg = self.feature_incompat & Incompat::META_BG.bits() != 0;
+        if !has_meta_bg || meta_bg < self.first_meta_bg as u64 {
+            if !self.group_has_super(g) {
+                return 0;
+            }
+            return if has_meta_bg {
+                self.first_meta_bg as u64
+            } else {
+                self.block_group_count().div_ceil(descs_per_block)
+            };
+        }
+        let in_meta = g % descs_per_block;
+        if in_meta == 0 || in_meta == 1 || in_meta == descs_per_block - 1 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Blocks at the head of group `g` that belong to the filesystem itself
+    /// whatever its block bitmap says: superblock backup, GDT copy and the
+    /// GDT blocks reserved for resize. For a `BLOCK_UNINIT` group the
+    /// on-disk bitmap is never read, so an allocator must keep off these
+    /// itself. (Bitmaps and inode tables are not counted: a group holding
+    /// any is never left `BLOCK_UNINIT`.)
+    pub fn group_head_overhead(&self, g: u64) -> u64 {
+        use crate::features::Incompat;
+        let has_super = self.group_has_super(g);
+        let gdt = self.group_num_gdt_blocks(g);
+        let descs_per_block = (self.block_size() / self.desc_size as u32) as u64;
+        let classic = self.feature_incompat & Incompat::META_BG.bits() == 0
+            || g / descs_per_block < self.first_meta_bg as u64;
+        let reserved = if has_super && classic {
+            self.reserved_gdt_blocks as u64
+        } else {
+            0
+        };
+        has_super as u64 + gdt + reserved
     }
 
     /// Number of block groups.

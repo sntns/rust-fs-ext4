@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- **Allocations into `BLOCK_UNINIT` groups** — the block and inode allocators
+  read the group descriptors' uninit flags and free counts from the mount-time
+  snapshot, so after the first allocation into an uninit group, every later
+  one in the same mount (the next sub-run of a fragmented `apply_pwrite`, its
+  extent-tree node block, the next file) got the same blocks again: files
+  overwrote each other, and an overwritten extent node read back as
+  `CorruptExtentTree("bad extent header magic")`. They now see the current
+  descriptors (`Filesystem::live_groups`). An uninit group's superblock / GDT
+  backup and reserved GDT blocks (`s_reserved_gdt_blocks`, meta_bg and
+  sparse_super2 aware) are kept off as well, both by the allocator and when the
+  group's bitmap is first materialized; they used to be handed out as data.
+
 ## [0.4.0] — 2026-06-30
 
 ### Features
