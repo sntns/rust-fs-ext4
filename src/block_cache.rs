@@ -1,8 +1,8 @@
 //! Buffer cache wrapping a `BlockDevice`.
 //!
 //! `CachedDevice` is the single source of truth for block contents
-//! within a mount session. Mirrors Linux's buffer-cache role for
-//! journaled filesystems: reads are served from the cache, writes
+//! within a mount session. It plays the part a buffer cache plays for a
+//! journaled filesystem: reads are served from the cache, writes
 //! update the cache, and the cache holds journaled-but-not-yet-
 //! checkpointed bytes so that subsequent reads see them before the
 //! data area on disk catches up.
@@ -16,10 +16,12 @@
 //!   disk still has the pre-commit content. Pinned entries are
 //!   NEVER evicted, since evicting them would lose the only
 //!   in-memory copy and the next allocator scan would re-read stale
-//!   bytes from disk. `Filesystem::commit_block_buffer` populates
-//!   `pinned` after a successful journal commit; the
+//!   bytes from disk. A read-only mount's journal replay
+//!   (`journal_apply::replay_into_cache`) populates `pinned`; the
 //!   `Filesystem::replay_journal_if_dirty` hook calls `unpin_all`
-//!   when the journal has been checkpointed.
+//!   when the journal has been checkpointed. A journaled commit pins
+//!   nothing: it checkpoints before returning, and its write-through
+//!   leaves clean entries (#328).
 //! - **Write-through update** — `write_at` UPDATES the cache (not
 //!   invalidates) and forwards to the inner device. This keeps the
 //!   cache consistent with disk for direct writes (e.g.
@@ -28,8 +30,8 @@
 //! - **Block-aligned reads only.** Multi-block reads bypass the
 //!   cache and pass through.
 //! - **Crash safety unchanged.** Pinned bytes are also persisted in
-//!   the journal log (the caller invoked `populate_cache` after a
-//!   journal commit); on crash, replay applies them. Clean LRU
+//!   the journal log (the caller replayed them from it); on crash,
+//!   replay applies them. Clean LRU
 //!   entries match disk by construction.
 //! - **No external LRU crate** — hand-rolled to avoid pulling in
 //!   GPL/LGPL deps and to keep the cache logic auditable.
@@ -103,6 +105,12 @@ impl CacheState {
             e.insert(bytes);
             return;
         }
+        // Capacity zero keeps no clean blocks: every read reaches the
+        // device, which is the uncached baseline `read_path_cost` measures
+        // (#68). Pinned blocks are unaffected.
+        if self.capacity == 0 {
+            return;
+        }
         if self.entries.len() >= self.capacity {
             if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, (_, seq))| *seq) {
                 self.entries.remove(&victim);
@@ -126,6 +134,9 @@ impl CacheState {
         // capacity-bound eviction kicks in if the LRU was already full.
         let drained: Vec<(u64, Vec<u8>)> = self.pinned.drain().collect();
         for (block, bytes) in drained {
+            if self.capacity == 0 {
+                continue;
+            }
             if self.entries.len() >= self.capacity {
                 if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, (_, seq))| *seq) {
                     self.entries.remove(&victim);
@@ -153,7 +164,7 @@ impl CachedDevice {
         Self {
             inner,
             block_size,
-            state: Mutex::new(CacheState::new(capacity.max(1))),
+            state: Mutex::new(CacheState::new(capacity)),
         }
     }
 
@@ -161,6 +172,13 @@ impl CachedDevice {
     pub fn stats(&self) -> (u64, u64) {
         let s = self.state.lock().expect("cache mutex poisoned");
         (s.hits, s.misses)
+    }
+
+    /// How many blocks are pinned: held whatever the capacity, because their
+    /// bytes are not yet at their final location on the device.
+    pub fn pinned_blocks(&self) -> usize {
+        let s = self.state.lock().expect("cache mutex poisoned");
+        s.pinned.len()
     }
 }
 
@@ -190,8 +208,27 @@ impl BlockDevice for CachedDevice {
             return Ok(());
         }
 
-        // Multi-block read (rare): bypass the cache, pass through.
-        self.inner.read_at(offset, buf)
+        // Multi-block read (rare): pass through, then lay any pinned
+        // blocks over it. Pinned bytes are not on disk yet, and the group
+        // descriptor table -- read this way -- is exactly what a journal
+        // replayed into the cache pins (#72). Clean entries match disk.
+        self.inner.read_at(offset, buf)?;
+        let state = self.state.lock().expect("cache mutex poisoned");
+        if state.pinned.is_empty() {
+            return Ok(());
+        }
+        let end = offset + len as u64;
+        for block in offset / bs..end.div_ceil(bs) {
+            let Some(img) = state.pinned.get(&block) else {
+                continue;
+            };
+            let block_start = block * bs;
+            let from = offset.max(block_start);
+            let to = end.min(block_start + bs);
+            buf[(from - offset) as usize..(to - offset) as usize]
+                .copy_from_slice(&img[(from - block_start) as usize..(to - block_start) as usize]);
+        }
+        Ok(())
     }
 
     fn size_bytes(&self) -> u64 {
@@ -277,12 +314,51 @@ impl BlockDevice for CachedDevice {
         let mut state = self.state.lock().expect("cache mutex poisoned");
         state.unpin_all();
     }
+
+    fn invalidate_cache(&self) -> Result<()> {
+        let mut state = self.state.lock().expect("cache mutex poisoned");
+        if !state.pinned.is_empty() {
+            return Err(crate::error::Error::Corrupt(
+                "cache contains uncheckpointed journal metadata",
+            ));
+        }
+        self.inner.invalidate_cache()?;
+        state.entries.clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn invalidation_requires_checkpoint_and_then_reads_physical_bytes() {
+        let raw = CountingDevice::new(8192, true);
+        let cache = CachedDevice::new(raw.clone(), 4096, 8);
+        let mut bytes = vec![0; 4096];
+        cache.read_at(0, &mut bytes).unwrap();
+        raw.write_at(0, &vec![7; 4096]).unwrap();
+        cache.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 0);
+        cache.invalidate_cache().unwrap();
+        cache.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 7);
+        cache.populate_cache(0, vec![9; 4096]);
+        assert!(
+            cache.invalidate_cache().is_err(),
+            "uncheckpointed metadata cannot be discarded"
+        );
+        cache.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 9);
+        raw.write_at(0, &vec![9; 4096]).unwrap();
+        cache.unpin_all();
+        cache.invalidate_cache().unwrap();
+        cache.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 9);
+        assert_eq!(raw.reads(), 3);
+    }
 
     /// Counts every read/write so we can prove the cache eliminates them.
     struct CountingDevice {
@@ -331,6 +407,22 @@ mod tests {
         fn is_writable(&self) -> bool {
             self.writable
         }
+    }
+
+    /// A read spanning several blocks sees the pinned ones. It went straight
+    /// to the device, so a group descriptor table longer than a block read
+    /// the on-disk descriptors under a journal replayed into the cache (#72).
+    #[test]
+    fn a_multi_block_read_sees_pinned_blocks() {
+        let inner = CountingDevice::new(4096 * 16, false);
+        let cached = CachedDevice::new(inner.clone(), 4096, 8);
+        cached.populate_cache(3, vec![0xBBu8; 4096]);
+        // From the middle of block 2 to the middle of block 4.
+        let mut buf = vec![0u8; 8192];
+        cached.read_at(2 * 4096 + 2048, &mut buf).unwrap();
+        assert_eq!(&buf[..2048], &[0u8; 2048][..], "block 2 is the device's");
+        assert_eq!(&buf[2048..6144], &[0xBBu8; 4096][..], "block 3 is pinned");
+        assert_eq!(&buf[6144..], &[0u8; 2048][..], "block 4 is the device's");
     }
 
     #[test]
@@ -395,6 +487,15 @@ mod tests {
         cached.read_at(0, &mut buf).unwrap();
         assert_eq!(inner.reads(), 2);
         assert_eq!(buf[0], 42, "post-write read should see the new bytes");
+        // The cache is write-through, not write-back: the bytes reach
+        // the device now, exactly once. Nothing asserted this before —
+        // `CountingDevice::writes()` existed and had no caller, which is
+        // what the crate-wide `allow(dead_code)` was hiding.
+        assert_eq!(
+            inner.writes(),
+            1,
+            "an unaligned write must reach the device once, not be held in cache"
+        );
     }
 
     #[test]

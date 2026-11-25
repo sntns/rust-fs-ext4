@@ -15,9 +15,14 @@
 //!     get the full file content.
 //!   - Maximum inline file size = 60 + (in-inode-xattr-region-size minus
 //!     headers and other entries). Typically 60–~150 bytes for inode_size=256.
+//!
+//! A directory uses the same two areas with one difference: the first 4
+//! bytes of `i_block` are its parent's inode number, and its entries start
+//! at byte 4 (see [`dir_entries`]).
 
 use crate::block_io::BlockDevice;
-use crate::error::Result;
+use crate::dir::{DirBlockIter, DirEntry, DirEntryType};
+use crate::error::{Error, Result};
 use crate::inode::Inode;
 use crate::xattr;
 
@@ -41,7 +46,11 @@ pub fn read_all(
     // Up to 60 bytes from i_block.
     let inline_max = 60;
     let from_block = total.min(inline_max);
-    let mut out = Vec::with_capacity(total);
+    // Reserved for what inline data can actually be -- the 60 bytes of
+    // i_block plus the in-inode xattr region, which is bounded by the
+    // inode size -- rather than for whatever `i_size` claimed. The
+    // vector grows to what is really there.
+    let mut out = Vec::with_capacity(total.min(64 * 1024));
     out.extend_from_slice(&inode.block[..from_block]);
 
     if total <= inline_max {
@@ -49,13 +58,119 @@ pub fn read_all(
     }
 
     // Overflow lives in the system.data xattr.
-    if let Some(extra) = xattr::get(dev, inode, inode_raw, inode_size, block_size, "system.data")? {
-        let need = total - inline_max;
-        let take = extra.len().min(need);
-        out.extend_from_slice(&extra[..take]);
+    //
+    // A missing or short xattr is CORRUPTION, not an empty tail. The
+    // inode's size field says the file is `total` bytes; if the bytes
+    // are not there, returning the 60 we do have would hand the caller
+    // a silently truncated file that still reports its full length —
+    // the worst of both, since nothing downstream can tell.
+    let need = total - inline_max;
+    let extra = xattr::get(dev, inode, inode_raw, inode_size, block_size, "system.data")?.ok_or(
+        crate::error::Error::Corrupt("inline file larger than 60 bytes has no system.data xattr"),
+    )?;
+    if extra.len() < need {
+        return Err(crate::error::Error::Corrupt(
+            "inline file's system.data xattr is shorter than its size claims",
+        ));
     }
+    out.extend_from_slice(&extra[..need]);
 
     Ok(out)
+}
+
+/// Bytes at the head of an inline directory's `i_block` that are not
+/// entries: the parent directory's inode number, the implicit `..`
+/// (format documentation, "Inline Directories": "The first four bytes of
+/// i_block are the inode number of the parent directory").
+pub const INLINE_DOTDOT_SIZE: usize = 4;
+
+/// Size of the `i_block` area that holds inline data.
+pub const INLINE_BLOCK_SIZE: usize = 60;
+
+/// The entries of an inline-data directory, in the order the kernel's
+/// readdir reports them: `.` (the directory itself), `..` (read from
+/// bytes 0..4 of `i_block`), the entries in `i_block[4..60]`, then those
+/// in `continuation` -- the `system.data` xattr value, empty when the
+/// directory fits in `i_block`.
+///
+/// An inline directory holds no `.` or `..` records: `.` is implicit, and
+/// `..` is a bare inode number. Entries start at byte 4, so parsing from
+/// byte 0 reads the parent's inode number as a record and fails with
+/// `bad rec_len` (#427).
+pub fn dir_entries(
+    dir_ino: u32,
+    inode: &Inode,
+    continuation: &[u8],
+    has_filetype: bool,
+) -> Result<Vec<DirEntry>> {
+    let parent = u32::from_le_bytes(inode.block[..INLINE_DOTDOT_SIZE].try_into().unwrap());
+    if parent == 0 {
+        return Err(Error::CorruptDirEntry(
+            "inline directory: parent inode number is 0",
+        ));
+    }
+    let mut out = vec![
+        DirEntry {
+            inode: dir_ino,
+            name: b".".to_vec(),
+            file_type: DirEntryType::Directory,
+        },
+        DirEntry {
+            inode: parent,
+            name: b"..".to_vec(),
+            file_type: DirEntryType::Directory,
+        },
+    ];
+    for area in [&inode.block[INLINE_DOTDOT_SIZE..], continuation] {
+        for entry in DirBlockIter::new(area, has_filetype) {
+            out.push(entry?);
+        }
+    }
+    Ok(out)
+}
+
+/// The `system.data` bytes an inline directory's entries continue into,
+/// or an empty vector when `i_size` says it fits in `i_block`. A size
+/// past 60 with no such xattr, or a shorter one, is corruption -- the
+/// same rule [`read_all`] applies to a file.
+pub fn dir_continuation(
+    dev: &dyn BlockDevice,
+    inode: &Inode,
+    inode_raw: &[u8],
+    inode_size: u16,
+    block_size: u32,
+) -> Result<Vec<u8>> {
+    let total = inode.size as usize;
+    if total <= INLINE_BLOCK_SIZE {
+        return Ok(Vec::new());
+    }
+    let need = total - INLINE_BLOCK_SIZE;
+    let mut extra = xattr::get(dev, inode, inode_raw, inode_size, block_size, "system.data")?
+        .ok_or(Error::Corrupt(
+            "inline directory larger than 60 bytes has no system.data xattr",
+        ))?;
+    if extra.len() < need {
+        return Err(Error::Corrupt(
+            "inline directory's system.data xattr is shorter than its size claims",
+        ));
+    }
+    extra.truncate(need);
+    Ok(extra)
+}
+
+/// Every entry of the inline-data directory `dir_ino`: [`dir_entries`]
+/// over `i_block` and its [`dir_continuation`].
+pub fn read_dir(
+    dev: &dyn BlockDevice,
+    dir_ino: u32,
+    inode: &Inode,
+    inode_raw: &[u8],
+    inode_size: u16,
+    block_size: u32,
+    has_filetype: bool,
+) -> Result<Vec<DirEntry>> {
+    let continuation = dir_continuation(dev, inode, inode_raw, inode_size, block_size)?;
+    dir_entries(dir_ino, inode, &continuation, has_filetype)
 }
 
 /// Read a range from an inline-data file.
@@ -79,4 +194,70 @@ pub fn read_range(
     let n = want.min(avail);
     dst[..n].copy_from_slice(&full[offset as usize..offset as usize + n]);
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inode::{Inode, OFF_MODE, OFF_SIZE_LO};
+
+    /// A device with nothing on it. The inline path only reaches the
+    /// device to look for the `system.data` xattr, and these tests are
+    /// about what happens when that xattr is not there.
+    struct EmptyDev;
+
+    impl BlockDevice for EmptyDev {
+        fn read_at(&self, _off: u64, buf: &mut [u8]) -> Result<()> {
+            buf.fill(0);
+            Ok(())
+        }
+        fn write_at(&self, _off: u64, _buf: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            1 << 20
+        }
+    }
+
+    /// A 128-byte inode claiming `size` bytes of a regular file, with
+    /// `i_block` filled with a recognisable pattern.
+    fn inline_inode(size: u32) -> (Inode, Vec<u8>) {
+        let mut raw = vec![0u8; 128];
+        raw[OFF_MODE..OFF_MODE + 2].copy_from_slice(&0o100_644u16.to_le_bytes());
+        raw[OFF_SIZE_LO..OFF_SIZE_LO + 4].copy_from_slice(&size.to_le_bytes());
+        // i_block at 0x28, 60 bytes.
+        for (i, b) in raw[0x28..0x28 + 60].iter_mut().enumerate() {
+            *b = b'A'.wrapping_add((i % 26) as u8);
+        }
+        let inode = Inode::parse(&raw).expect("parse synthetic inode");
+        (inode, raw)
+    }
+
+    /// A file that fits entirely in `i_block` needs no xattr, so an
+    /// empty device is fine.
+    #[test]
+    fn a_file_within_the_inline_area_reads_without_an_xattr() {
+        let (inode, raw) = inline_inode(60);
+        let got =
+            read_all(&EmptyDev, &inode, &raw, 128, 4096).expect("60 bytes are all in i_block");
+        assert_eq!(got.len(), 60);
+    }
+
+    /// **The fix.** A file claiming more than 60 bytes whose
+    /// `system.data` xattr is absent is corrupt, and must say so.
+    ///
+    /// Before this, the missing xattr was skipped silently and the
+    /// caller received 60 bytes for a file whose size field said more
+    /// — a truncated read that nothing downstream could detect,
+    /// because the length in the metadata still claimed the full size.
+    #[test]
+    fn a_missing_spill_xattr_is_corruption_not_an_empty_tail() {
+        let (inode, raw) = inline_inode(100);
+        let err = read_all(&EmptyDev, &inode, &raw, 128, 4096)
+            .expect_err("100 bytes cannot fit in the 60-byte inline area without a spill");
+        assert!(
+            format!("{err:?}").contains("system.data"),
+            "the error should name the missing xattr, got: {err:?}"
+        );
+    }
 }

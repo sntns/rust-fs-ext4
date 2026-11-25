@@ -4,11 +4,13 @@
 
 use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
+#[track_caller]
+fn src_image() -> String {
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img")
+}
 
 fn last_err_str() -> String {
     unsafe {
@@ -23,15 +25,11 @@ fn last_err_str() -> String {
 fn scratch_image() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dst = PathBuf::from(format!(
-        "/tmp/fs_ext4_capi_rename_{}_{n}.img",
+    let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
+        "fs_ext4_capi_rename_{}_{n}.img",
         std::process::id()
     ));
-    let bytes = std::fs::read(SRC_IMAGE).expect("read src image");
-    let mut out = std::fs::File::create(&dst).expect("create dst image");
-    out.write_all(&bytes).expect("write dst image");
-    out.flush().expect("flush");
-    drop(out);
+    std::fs::copy(src_image(), &dst).expect("copy src image");
     dst
 }
 
@@ -206,7 +204,7 @@ fn rename_refuses_missing_source() {
 
 #[test]
 fn rename_refuses_on_ro_mount() {
-    let img_c = CString::new(SRC_IMAGE).unwrap();
+    let img_c = CString::new(src_image()).unwrap();
 
     let fs = unsafe { fs_ext4_mount(img_c.as_ptr()) };
     assert!(!fs.is_null(), "mount: {}", last_err_str());

@@ -7,28 +7,32 @@
 use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::os::raw::c_void;
-use std::path::Path;
 
-const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-acl.img");
+const IMAGE: &str = "ext4-acl.img";
 
-fn mount_or_skip() -> Option<*mut fs_ext4_fs_t> {
-    if !Path::new(IMAGE).exists() {
-        eprintln!("skip: {IMAGE} not built");
-        return None;
-    }
-    let p = CString::new(IMAGE).unwrap();
+fn mount_fixture() -> *mut fs_ext4_fs_t {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), IMAGE);
+    let p = CString::new(path.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
-    if fs.is_null() {
-        eprintln!("skip: mount failed on {IMAGE}");
-        return None;
-    }
-    Some(fs)
+    assert!(
+        !fs.is_null(),
+        "fs_ext4_mount({path}) failed: {}",
+        unsafe { std::ffi::CStr::from_ptr(fs_ext4_last_error()) }.to_string_lossy()
+    );
+    fs
 }
 
 fn names_on(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
     let p = CString::new(path).unwrap();
     let mut buf = vec![0u8; 1024];
-    let n = unsafe { fs_ext4_listxattr(fs, p.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let n = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            p.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     if n < 0 {
         let err = unsafe {
             std::ffi::CStr::from_ptr(fs_ext4_last_error())
@@ -75,9 +79,7 @@ fn get_bytes(fs: *mut fs_ext4_fs_t, path: &str, name: &str) -> Option<Vec<u8>> {
 
 #[test]
 fn named_txt_exposes_posix_acl_access_via_capi() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let names = names_on(fs, "/named.txt");
     assert!(
         names.iter().any(|n| n == "system.posix_acl_access"),
@@ -97,9 +99,7 @@ fn named_txt_exposes_posix_acl_access_via_capi() {
 
 #[test]
 fn acl_dir_exposes_posix_acl_default_via_capi() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let names = names_on(fs, "/acl_dir");
     assert!(
         names.iter().any(|n| n == "system.posix_acl_default"),
@@ -113,9 +113,7 @@ fn acl_dir_exposes_posix_acl_default_via_capi() {
 
 #[test]
 fn plain_txt_has_no_acl_xattrs_via_capi() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let names = names_on(fs, "/plain.txt");
     assert!(
         !names.iter().any(|n| n.starts_with("system.posix_acl_")),

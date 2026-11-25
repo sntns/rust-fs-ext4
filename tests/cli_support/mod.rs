@@ -1,0 +1,325 @@
+//! What the command-line tests share: the multi-call binary, reached
+//! under each of its names, and a place to put images.
+//!
+//! The binary is built only with the `cli` feature. `scripts/test.sh`
+//! turns it on for every tier; a bare `cargo test` does not, and then
+//! these tests FAIL naming the fix rather than skipping.
+
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::OnceLock;
+
+/// The repository-named entry point, as cargo built it.
+///
+/// `option_env!`, not `env!`: without the feature `env!` would fail the
+/// compile of every test target in the run, where this fails only the
+/// tests that need the binary, each with the fix in its message.
+const BIN: Option<&str> = option_env!("CARGO_BIN_EXE_rust-fs-ext4");
+
+const NO_BIN: &str = "the rust-fs-ext4 binary is built only with `--features cli`. Run the \
+    tests through scripts/test.sh, which passes it, or add `--features cli` to cargo test.";
+
+pub fn bin() -> &'static str {
+    BIN.expect(NO_BIN)
+}
+
+/// The binary under its own (cargo's) name: the repository entry point.
+pub fn entry() -> Command {
+    let mut cmd = Command::new(BIN.expect(NO_BIN));
+    cmd.env("TMPDIR", fs_ext4_test_support::temp_dir());
+    cmd
+}
+
+/// The program as a user runs it under `name`: argv[0] is what an
+/// installed symlink hands it, and what it dispatches on.
+pub fn tool(name: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = entry();
+    cmd.arg0(name);
+    cmd
+}
+
+/// A directory holding the binary under every name it answers to, as an
+/// install links it: `rust-fs-ext4` and each dotted name, symlinks to
+/// cargo's build.
+pub fn names_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = PathBuf::from(fs_ext4_test_support::temp_path!(
+            "cli-names-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the names directory");
+        let mut names = dotted_names();
+        names.push("rust-fs-ext4".to_string());
+        for name in names {
+            std::os::unix::fs::symlink(bin(), dir.join(&name))
+                .unwrap_or_else(|e| panic!("link {name}: {e}"));
+        }
+        dir
+    })
+}
+
+/// The dotted names, as the binary itself lists them for packaging.
+pub fn dotted_names() -> Vec<String> {
+    let out = entry()
+        .args(["generate", "names"])
+        .output()
+        .expect("run rust-fs-ext4 generate names");
+    assert!(out.status.success(), "generate names failed: {out:?}");
+    String::from_utf8(out.stdout)
+        .expect("names are UTF-8")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A fresh image path in the scratch directory, not yet created.
+pub fn image_path(tag: &str) -> String {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = fs_ext4_test_support::temp_path!("cli-{}-{n}-{tag}.img", std::process::id());
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+/// A fresh path, not yet created, on a filesystem that keeps sub-second
+/// times: what `--preserve=times` reads them from or writes them to. The
+/// scratch root is the repository's `tmp`, and when the suite runs in the
+/// harness guest that is the 9p share, which keeps no nanoseconds; there
+/// the path is in the guest's own `/var/tmp`. Neither keeping them fails,
+/// naming both.
+pub fn sub_second_path(tag: &str) -> String {
+    path_where(
+        tag,
+        "keeps sub-second times, which --preserve=times needs",
+        keeps_sub_second_times,
+    )
+}
+
+/// A fresh path, not yet created, in the scratch directory when `keeps`
+/// holds there, and otherwise in `/var/tmp`, the guest's own disk when the
+/// scratch directory is the harness guest's 9p share. Neither holding
+/// fails, naming both and `what` the test needed.
+pub fn path_where(tag: &str, what: &str, keeps: impl Fn(&Path) -> bool) -> String {
+    let scratch = image_path(tag);
+    let name = Path::new(&scratch).file_name().unwrap().to_owned();
+    let local = Path::new("/var/tmp")
+        .join(name)
+        .to_string_lossy()
+        .into_owned();
+    for path in [&scratch, &local] {
+        if keeps(Path::new(path).parent().unwrap()) {
+            return path.clone();
+        }
+    }
+    panic!("neither {scratch}'s directory nor /var/tmp {what}");
+}
+
+/// Whether a file in `dir` keeps the nanoseconds of the access and
+/// modification times set on it.
+pub fn keeps_sub_second_times(dir: &Path) -> bool {
+    let probe = dir.join(format!(".sub-second-probe-{}", std::process::id()));
+    let at = std::time::UNIX_EPOCH + std::time::Duration::new(1_000_000_000, 123_456_789);
+    let kept = std::fs::create_dir_all(dir).is_ok()
+        && std::fs::File::create(&probe)
+            .and_then(|f| f.set_times(std::fs::FileTimes::new().set_accessed(at).set_modified(at)))
+            .is_ok()
+        && std::fs::metadata(&probe)
+            .and_then(|m| Ok((m.accessed()?, m.modified()?)))
+            .is_ok_and(|(a, m)| a == at && m == at);
+    let _ = std::fs::remove_file(&probe);
+    kept
+}
+
+/// A sparse file of `size` bytes, ready to format.
+pub fn sized_image(tag: &str, size: u64) -> String {
+    let path = image_path(tag);
+    std::fs::File::create(&path)
+        .and_then(|f| f.set_len(size))
+        .unwrap_or_else(|e| panic!("size {path}: {e}"));
+    path
+}
+
+/// The exit status of a namespace verb's refusal, from the reason the
+/// kernel gave the same call: 4, `refused`, where the volume's state
+/// forbids it (a directory that is not empty, a name already there, a
+/// missing target, a part of the path that is not a directory), as the
+/// CLI contract has it (EXIT_REFUSED); 1 for every other refusal.
+pub fn refusal_code(kernel_reason: &str) -> i32 {
+    match kernel_reason {
+        "Directory not empty" | "File exists" | "No such file or directory" | "Not a directory" => {
+            4
+        }
+        _ => 1,
+    }
+}
+
+pub fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+pub fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Run and require success, returning the output.
+#[track_caller]
+pub fn ok(cmd: &mut Command) -> Output {
+    let out = cmd.output().expect("spawn");
+    assert!(
+        out.status.success(),
+        "{cmd:?} failed ({:?})\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        stdout(&out),
+        stderr(&out)
+    );
+    out
+}
+
+/// The value of `"key": ...` in a JSON report: enough of a reader for the
+/// flat reports these tests check, without a JSON dependency. Strings
+/// come back without their quotes; anything else as written.
+#[track_caller]
+pub fn json_field(json: &str, key: &str) -> String {
+    let needle = format!("\"{key}\": ");
+    let start = json
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no {key:?} in:\n{json}"))
+        + needle.len();
+    let rest = &json[start..];
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"').expect("closing quote");
+        stripped[..end].to_string()
+    } else {
+        rest.split([',', '\n', '}'])
+            .next()
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+}
+
+/// Damage `image` in a way the audit can repair: group 0's descriptor
+/// claims `extra` more free blocks than its bitmap has, with the
+/// descriptor's checksum restamped so the volume still mounts.
+pub fn corrupt_group_free_blocks(image: &str, extra: u16) {
+    use fs_ext4::block_io::{BlockDevice, FileDevice};
+    let fs = fs_ext4::Filesystem::mount(std::sync::Arc::new(
+        FileDevice::open(image).expect("open image"),
+    ))
+    .expect("mount image");
+    let block = u64::from(fs.sb.block_size());
+    let desc_size = usize::from(fs.sb.desc_size.max(32));
+    let at = (u64::from(fs.sb.first_data_block) + 1) * block;
+    let dev = FileDevice::open_rw(image).expect("open image rw");
+    let mut desc = vec![0u8; desc_size];
+    dev.read_at(at, &mut desc).expect("read descriptor 0");
+    let free = u16::from_le_bytes([desc[0x0C], desc[0x0D]]);
+    desc[0x0C..0x0E].copy_from_slice(&free.wrapping_add(extra).to_le_bytes());
+    if let Some(csum) = fs_ext4::checksum::group_desc_csum(&fs.sb, &fs.csum, 0, &desc) {
+        desc[0x1E..0x20].copy_from_slice(&csum.to_le_bytes());
+    }
+    dev.write_at(at, &desc).expect("write descriptor 0");
+    dev.flush().expect("flush");
+}
+
+/// Damage `image` in a way nothing repairs: the root directory's extent
+/// header is zeroed, with the inode's checksum restamped so it is the
+/// extent tree, not the checksum, that is wrong.
+pub fn destroy_root_extent_header(image: &str) {
+    destroy_extent_header(image, 2);
+}
+
+/// [`destroy_root_extent_header`] for any inode: `ino`'s extent header is
+/// zeroed and its checksum restamped, so the inode itself still reads and
+/// only its contents cannot be found.
+pub fn destroy_extent_header(image: &str, ino: u32) {
+    use fs_ext4::block_io::{BlockDevice, FileDevice};
+    let fs = fs_ext4::Filesystem::mount(std::sync::Arc::new(
+        FileDevice::open(image).expect("open image"),
+    ))
+    .expect("mount image");
+    let (block, offset) =
+        fs_ext4::bgd::locate_inode(&fs.sb, &fs.groups, ino).expect("locate the inode");
+    let at = block * u64::from(fs.sb.block_size()) + u64::from(offset);
+    let dev = FileDevice::open_rw(image).expect("open image rw");
+    let mut raw = vec![0u8; usize::from(fs.sb.inode_size)];
+    dev.read_at(at, &mut raw).expect("read the inode");
+    raw[0x28..0x28 + 12].fill(0);
+    let generation = u32::from_le_bytes(raw[0x64..0x68].try_into().unwrap());
+    if let Some((lo, hi)) = fs.csum.compute_inode_checksum(ino, generation, &raw) {
+        raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+        let extra_isize = u16::from_le_bytes([raw[0x80], raw[0x81]]);
+        if raw.len() > 0x84 && extra_isize >= 4 {
+            raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+        }
+    }
+    dev.write_at(at, &raw).expect("write the inode");
+    dev.flush().expect("flush");
+}
+
+/// Bytes nobody would type: a fixed LCG, so a failure reproduces.
+pub fn pattern(len: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    (0..len)
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (x >> 16) as u8
+        })
+        .collect()
+}
+
+/// `fs.ext4 <image> write <path>` with `bytes` on stdin; the output.
+pub fn fs_write(image: &str, path: &str, bytes: &[u8]) -> Output {
+    use std::io::Write;
+    let mut child = tool("fs.ext4")
+        .args([image, "write", path])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fs.ext4 write");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(bytes)
+        .expect("feed stdin");
+    child.wait_with_output().expect("wait for fs.ext4 write")
+}
+
+/// The files the write tests put in an image: every size boundary a
+/// 4 KiB block has, a MiB of noise, a file in a subdirectory, and one
+/// replaced by a shorter one (its final content is what is listed).
+pub fn write_cases() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("/empty", Vec::new()),
+        ("/one", pattern(1, 1)),
+        ("/f4095", pattern(4095, 2)),
+        ("/f4096", pattern(4096, 3)),
+        ("/f4097", pattern(4097, 4)),
+        ("/big", pattern(1 << 20, 5)),
+        ("/d/e/deep", pattern(5000, 6)),
+        ("/replaced", pattern(100, 8)),
+    ]
+}
+
+/// A fresh image of ours with `/d/e` made and every [`write_cases`] file
+/// written through `fs.ext4`, `/replaced` first at 9000 bytes.
+pub fn written_image(tag: &str) -> String {
+    let img = image_path(tag);
+    ok(tool("mkfs.ext4").args(["-q", "--text", "--size", "64M", &img]));
+    ok(tool("fs.ext4").args([&img, "mkdir", "/d"]));
+    ok(tool("fs.ext4").args([&img, "mkdir", "/d/e"]));
+    let first = fs_write(&img, "/replaced", &pattern(9000, 7));
+    assert!(first.status.success(), "{}", stderr(&first));
+    for (path, bytes) in write_cases() {
+        let out = fs_write(&img, path, &bytes);
+        assert!(out.status.success(), "write {path}: {}", stderr(&out));
+    }
+    img
+}

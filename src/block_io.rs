@@ -9,10 +9,10 @@
 //! it when the underlying resource allows writes.
 
 use crate::error::{Error, Result};
-use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::Mutex;
 
 /// Random-access block device. Reads required; writes optional.
 pub trait BlockDevice: Send + Sync {
@@ -44,9 +44,9 @@ pub trait BlockDevice: Send + Sync {
 
     /// Buffer-cache hook: stash `bytes` for `block` so a subsequent
     /// `read_at` returns those bytes instead of reading from physical
-    /// storage. Used by `commit_block_buffer` to make journaled
-    /// metadata visible to readers before the journal is checkpointed
-    /// back to the data area on disk.
+    /// storage. Used by a read-only mount's journal replay to make
+    /// committed metadata visible to readers without writing it back to
+    /// the data area on disk.
     ///
     /// Pinned entries inserted via `populate_cache` MUST NOT be evicted
     /// — they're the only place those bytes exist until `unpin_all`
@@ -61,6 +61,13 @@ pub trait BlockDevice: Send + Sync {
     /// consistent with disk and can be evicted under normal LRU
     /// pressure. No-op for un-cached devices.
     fn unpin_all(&self) {}
+
+    /// Discard clean read-cache entries. Pinned journal metadata must be
+    /// checkpointed and unpinned first; cached implementations reject otherwise.
+    /// This does not flush writes and requires exclusive filesystem ownership.
+    fn invalidate_cache(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// File-backed device — used for disk images and `/dev/diskN`.
@@ -73,6 +80,13 @@ pub struct FileDevice {
 impl FileDevice {
     /// Open read-only. Matches pre-existing behaviour.
     pub fn open(path: &str) -> Result<Self> {
+        Self::open_path(Path::new(path))
+    }
+
+    /// Open read-only by a path that need not be UTF-8: a device or image
+    /// name is bytes on Unix, and a lossy rendering of it can name another
+    /// file.
+    pub fn open_path(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         Ok(Self {
@@ -86,6 +100,12 @@ impl FileDevice {
     /// or apply Phase 4 mutations. Falls back to an error if the path is
     /// not writable.
     pub fn open_rw(path: &str) -> Result<Self> {
+        Self::open_path_rw(Path::new(path))
+    }
+
+    /// Open read-write by a path that need not be UTF-8; see
+    /// [`FileDevice::open_path`].
+    pub fn open_path_rw(path: &Path) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
         Ok(Self {
@@ -196,102 +216,76 @@ impl BlockDevice for CallbackDevice {
 }
 
 // ---------------------------------------------------------------------------
-// CachingDevice — small LRU block cache decorator
+// AlignedDevice — sector-aligned I/O over a device that requires it
 // ---------------------------------------------------------------------------
 
-/// LRU read cache wrapping another `BlockDevice`.
+/// Presents a byte-granular [`BlockDevice`] over one that accepts only
+/// requests whose offset and length are multiples of `sector` (#373).
 ///
-/// Caches only reads whose `offset` is a multiple of `block_size` AND whose
-/// `buf.len() == block_size`. Every other read bypasses the cache and goes
-/// straight to the inner device — the common hot paths (`fs.read_block`,
-/// `extent::lookup` child-block reads, bitmap reads) all satisfy that
-/// constraint, while `file_io::read`'s arbitrary-offset reads don't need
-/// caching (the OS page cache handles them when backed by `FileDevice`).
+/// The engine reads 1024 bytes at offset 1024 for the superblock, and its
+/// write path passes sub-block writes through; a host block resource that
+/// only takes sector-aligned I/O refuses both. Here:
 ///
-/// Writes invalidate any cached block whose range overlaps. The cache is
-/// held under a single `Mutex` — fine for fs-driver workloads, which are
-/// metadata-heavy rather than contention-bound.
-pub struct CachingDevice {
-    inner: Arc<dyn BlockDevice>,
-    block_size: u64,
-    state: Mutex<CacheState>,
+/// - an aligned request passes straight through, with no copy;
+/// - an unaligned read reads the enclosing aligned span into a bounce
+///   buffer and copies the requested slice out;
+/// - an unaligned write reads the enclosing span's first and last sectors,
+///   patches the caller's bytes in, and writes the whole span back as one
+///   aligned request.
+///
+/// Every write holds one lock, so a read-modify-write can neither lose nor
+/// be lost to a concurrent write into the same sector.
+pub struct AlignedDevice<D: BlockDevice> {
+    inner: D,
+    sector: u64,
+    write_lock: Mutex<()>,
 }
 
-struct CacheState {
-    /// Fixed-capacity LRU; head is most-recently used.
-    entries: VecDeque<(u64, Arc<Vec<u8>>)>,
-    capacity: usize,
-    hits: u64,
-    misses: u64,
-}
-
-impl CachingDevice {
-    /// Wrap `inner`, caching at most `capacity` blocks of size `block_size`.
-    pub fn new(inner: Arc<dyn BlockDevice>, block_size: u64, capacity: usize) -> Arc<Self> {
-        Arc::new(Self {
+impl<D: BlockDevice> AlignedDevice<D> {
+    /// Wrap `inner`, whose requests must be multiples of `sector` bytes.
+    /// `sector` must be a power of two.
+    pub fn new(inner: D, sector: u32) -> Self {
+        assert!(
+            sector.is_power_of_two(),
+            "sector size {sector} is not a power of two"
+        );
+        AlignedDevice {
             inner,
-            block_size,
-            state: Mutex::new(CacheState {
-                entries: VecDeque::with_capacity(capacity),
-                capacity,
-                hits: 0,
-                misses: 0,
-            }),
-        })
+            sector: sector as u64,
+            write_lock: Mutex::new(()),
+        }
     }
 
-    /// Returns `(hits, misses)` — useful for tests and telemetry.
-    pub fn stats(&self) -> (u64, u64) {
-        let s = self.state.lock().unwrap();
-        (s.hits, s.misses)
+    fn is_aligned(&self, offset: u64, len: usize) -> bool {
+        let mask = self.sector - 1;
+        offset & mask == 0 && (len as u64) & mask == 0
     }
 
-    /// Drop every cached block. Callers should invoke this after any
-    /// operation that mutates the underlying device outside this wrapper.
-    pub fn invalidate_all(&self) {
-        let mut s = self.state.lock().unwrap();
-        s.entries.clear();
-    }
-
-    fn invalidate_range(state: &mut CacheState, start: u64, end: u64, block_size: u64) {
-        state.entries.retain(|(off, _)| {
-            let block_end = off.saturating_add(block_size);
-            *off >= end || block_end <= start
-        });
+    /// The aligned span `[start, end)` enclosing `len` bytes at `offset`.
+    fn span(&self, offset: u64, len: usize) -> Result<(u64, u64)> {
+        let mask = self.sector - 1;
+        let end = offset
+            .checked_add(len as u64)
+            .and_then(|e| e.checked_add(mask))
+            .ok_or(Error::Corrupt("device request overflows u64"))?
+            & !mask;
+        if end > self.inner.size_bytes() {
+            return Err(Error::Corrupt("device request past the end of the device"));
+        }
+        Ok((offset & !mask, end))
     }
 }
 
-impl BlockDevice for CachingDevice {
+impl<D: BlockDevice> BlockDevice for AlignedDevice<D> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        // Only cache exact block-aligned, block-sized reads.
-        let cacheable =
-            buf.len() as u64 == self.block_size && offset.is_multiple_of(self.block_size);
-        if !cacheable {
+        if self.is_aligned(offset, buf.len()) {
             return self.inner.read_at(offset, buf);
         }
-
-        // Probe the cache.
-        {
-            let mut s = self.state.lock().unwrap();
-            if let Some(pos) = s.entries.iter().position(|(o, _)| *o == offset) {
-                // Hit — move to front, copy out.
-                let entry = s.entries.remove(pos).unwrap();
-                buf.copy_from_slice(&entry.1);
-                s.entries.push_front(entry);
-                s.hits += 1;
-                return Ok(());
-            }
-            s.misses += 1;
-        }
-
-        // Miss — read underlying, then insert (evicting LRU).
-        self.inner.read_at(offset, buf)?;
-        let data = Arc::new(buf.to_vec());
-        let mut s = self.state.lock().unwrap();
-        if s.entries.len() >= s.capacity {
-            s.entries.pop_back();
-        }
-        s.entries.push_front((offset, data));
+        let (start, end) = self.span(offset, buf.len())?;
+        let mut bounce = vec![0u8; (end - start) as usize];
+        self.inner.read_at(start, &mut bounce)?;
+        let head = (offset - start) as usize;
+        buf.copy_from_slice(&bounce[head..head + buf.len()]);
         Ok(())
     }
 
@@ -300,13 +294,27 @@ impl BlockDevice for CachingDevice {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        let end = offset.saturating_add(buf.len() as u64);
-        {
-            let mut s = self.state.lock().unwrap();
-            let bs = self.block_size;
-            Self::invalidate_range(&mut s, offset, end, bs);
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.is_aligned(offset, buf.len()) {
+            return self.inner.write_at(offset, buf);
         }
-        self.inner.write_at(offset, buf)
+        let (start, end) = self.span(offset, buf.len())?;
+        let sector = self.sector as usize;
+        let mut bounce = vec![0u8; (end - start) as usize];
+        let head = (offset - start) as usize;
+        let tail = head + buf.len();
+        // Only the first and last sectors hold bytes the caller is not
+        // replacing; every sector between them is overwritten whole.
+        if head != 0 {
+            self.inner.read_at(start, &mut bounce[..sector])?;
+        }
+        let last = bounce.len() - sector;
+        if !tail.is_multiple_of(sector) && (last != 0 || head == 0) {
+            self.inner
+                .read_at(start + last as u64, &mut bounce[last..])?;
+        }
+        bounce[head..tail].copy_from_slice(buf);
+        self.inner.write_at(start, &bounce)
     }
 
     fn flush(&self) -> Result<()> {
@@ -316,125 +324,56 @@ impl BlockDevice for CachingDevice {
     fn is_writable(&self) -> bool {
         self.inner.is_writable()
     }
+
+    fn populate_cache(&self, block: u64, bytes: Vec<u8>) {
+        self.inner.populate_cache(block, bytes)
+    }
+
+    fn unpin_all(&self) {
+        self.inner.unpin_all()
+    }
+
+    fn invalidate_cache(&self) -> Result<()> {
+        self.inner.invalidate_cache()
+    }
 }
 
+// ---------------------------------------------------------------------------
+// CachingDevice — small LRU block cache decorator
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
-mod tests {
+mod aligned_device_tests {
     use super::*;
-    use std::io::Write;
 
-    fn tmp_image(bytes: &[u8]) -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = format!("/tmp/fs_ext4_block_io_test_{}_{n}.img", std::process::id());
-        let mut f = File::create(&path).unwrap();
-        f.write_all(bytes).unwrap();
-        path
-    }
+    const SECTOR: u64 = 512;
 
-    #[test]
-    fn file_device_ro_write_rejected() {
-        let path = tmp_image(&[0u8; 4096]);
-        let dev = FileDevice::open(&path).unwrap();
-        assert!(!dev.is_writable());
-        let err = dev.write_at(0, &[1u8; 16]).unwrap_err();
-        match err {
-            Error::Corrupt(msg) => assert!(msg.contains("read-only")),
-            _ => panic!(),
-        }
-        std::fs::remove_file(path).ok();
-    }
+    /// An in-memory device that refuses any request not aligned to SECTOR.
+    struct Strict(Mutex<Vec<u8>>);
 
-    #[test]
-    fn file_device_rw_round_trip() {
-        let path = tmp_image(&[0u8; 4096]);
-        let dev = FileDevice::open_rw(&path).unwrap();
-        assert!(dev.is_writable());
-        dev.write_at(100, &[0xAB, 0xCD, 0xEF]).unwrap();
-        dev.flush().unwrap();
-        let mut buf = [0u8; 3];
-        dev.read_at(100, &mut buf).unwrap();
-        assert_eq!(buf, [0xAB, 0xCD, 0xEF]);
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn best_effort_falls_back_to_ro() {
-        // Create a file without write permission.
-        let path = tmp_image(&[0u8; 4096]);
-        let mut perm = std::fs::metadata(&path).unwrap().permissions();
-        perm.set_readonly(true);
-        std::fs::set_permissions(&path, perm).unwrap();
-
-        let dev = FileDevice::open_best_effort(&path).unwrap();
-        assert!(
-            !dev.is_writable(),
-            "read-only file should not report writable"
-        );
-        // Cleanup: restore writability so remove_file succeeds.
-        let mut perm = std::fs::metadata(&path).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perm.set_readonly(false);
-        std::fs::set_permissions(&path, perm).unwrap();
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn callback_device_without_writer_rejects_writes() {
-        let dev = CallbackDevice {
-            size: 4096,
-            read: Box::new(|_, buf| {
-                buf.fill(0);
-                Ok(())
-            }),
-            write: None,
-            flush: None,
-        };
-        assert!(!dev.is_writable());
-        assert!(dev.write_at(0, &[0u8; 4]).is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // CachingDevice
-    // -----------------------------------------------------------------------
-
-    /// Instrumented inner device — counts `read_at`/`write_at` calls and
-    /// backs reads with a deterministic pattern (byte = (offset % 251) + i%7).
-    struct CountingDev {
-        size: u64,
-        read_calls: Mutex<u64>,
-        write_calls: Mutex<u64>,
-        bytes: Mutex<Vec<u8>>,
-    }
-    impl CountingDev {
-        fn new(bytes: Vec<u8>) -> Self {
-            Self {
-                size: bytes.len() as u64,
-                read_calls: Mutex::new(0),
-                write_calls: Mutex::new(0),
-                bytes: Mutex::new(bytes),
+    impl Strict {
+        fn check(offset: u64, len: usize) -> Result<()> {
+            if !offset.is_multiple_of(SECTOR) || !(len as u64).is_multiple_of(SECTOR) {
+                return Err(Error::Corrupt("unaligned request"));
             }
+            Ok(())
         }
     }
-    impl BlockDevice for CountingDev {
+
+    impl BlockDevice for Strict {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-            *self.read_calls.lock().unwrap() += 1;
-            let b = self.bytes.lock().unwrap();
-            let start = offset as usize;
-            let end = start + buf.len();
-            buf.copy_from_slice(&b[start..end]);
+            Self::check(offset, buf.len())?;
+            let b = self.0.lock().unwrap();
+            buf.copy_from_slice(&b[offset as usize..offset as usize + buf.len()]);
             Ok(())
         }
         fn size_bytes(&self) -> u64 {
-            self.size
+            self.0.lock().unwrap().len() as u64
         }
         fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-            *self.write_calls.lock().unwrap() += 1;
-            let mut b = self.bytes.lock().unwrap();
-            let start = offset as usize;
-            let end = start + buf.len();
-            b[start..end].copy_from_slice(buf);
+            Self::check(offset, buf.len())?;
+            let mut b = self.0.lock().unwrap();
+            b[offset as usize..offset as usize + buf.len()].copy_from_slice(buf);
             Ok(())
         }
         fn is_writable(&self) -> bool {
@@ -442,100 +381,56 @@ mod tests {
         }
     }
 
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + 3) as u8).collect()
+    }
+
+    /// Every (offset, length) shape against a 4-sector device: inside one
+    /// sector, touching either edge, straddling one boundary, spanning
+    /// whole sectors between two partial ones, and fully aligned.
     #[test]
-    fn caching_device_caches_repeated_reads() {
-        let bytes = (0u8..=255u8).cycle().take(64 * 1024).collect::<Vec<_>>();
-        let inner: Arc<CountingDev> = Arc::new(CountingDev::new(bytes.clone()));
-        let inner_trait: Arc<dyn BlockDevice> = inner.clone();
-        let dev = CachingDevice::new(inner_trait, 4096, 4);
-
-        let mut buf = vec![0u8; 4096];
-        dev.read_at(0, &mut buf).unwrap();
-        assert_eq!(&buf, &bytes[0..4096]);
-        dev.read_at(0, &mut buf).unwrap();
-        dev.read_at(0, &mut buf).unwrap();
-
-        assert_eq!(
-            *inner.read_calls.lock().unwrap(),
-            1,
-            "cache should absorb repeats"
-        );
-        let (hits, misses) = dev.stats();
-        assert_eq!((hits, misses), (2, 1));
+    fn unaligned_reads_and_writes_match_a_byte_granular_model() {
+        let size = 4 * SECTOR as usize;
+        let cases: &[(u64, usize)] = &[
+            (0, 1),
+            (1, 10),
+            (500, 12),
+            (511, 1),
+            (510, 4),
+            (0, 512),
+            (512, 1024),
+            (100, 1500),
+            (1, 2046),
+            (1024, 1),
+            (2047, 1),
+            (0, 2048),
+            (3, 0),
+        ];
+        for &(off, len) in cases {
+            let base = pattern(size);
+            let dev = AlignedDevice::new(Strict(Mutex::new(base.clone())), SECTOR as u32);
+            let data: Vec<u8> = (0..len).map(|i| !(i as u8)).collect();
+            dev.write_at(off, &data)
+                .unwrap_or_else(|e| panic!("write {len}@{off}: {e:?}"));
+            let mut model = base;
+            model[off as usize..off as usize + len].copy_from_slice(&data);
+            assert!(
+                *dev.inner.0.lock().unwrap() == model,
+                "write {len}@{off} disturbed bytes outside it"
+            );
+            let mut back = vec![0u8; len];
+            dev.read_at(off, &mut back)
+                .unwrap_or_else(|e| panic!("read {len}@{off}: {e:?}"));
+            assert_eq!(back, data, "read {len}@{off}");
+        }
     }
 
     #[test]
-    fn caching_device_bypasses_non_aligned_reads() {
-        let bytes = vec![0x5A; 8192];
-        let inner: Arc<CountingDev> = Arc::new(CountingDev::new(bytes));
-        let inner_trait: Arc<dyn BlockDevice> = inner.clone();
-        let dev = CachingDevice::new(inner_trait, 4096, 2);
-
-        let mut buf = vec![0u8; 100];
-        dev.read_at(123, &mut buf).unwrap();
-        dev.read_at(123, &mut buf).unwrap();
-
-        assert_eq!(*inner.read_calls.lock().unwrap(), 2);
-        let (hits, misses) = dev.stats();
-        assert_eq!((hits, misses), (0, 0));
-    }
-
-    #[test]
-    fn caching_device_evicts_lru() {
-        let bytes = vec![0u8; 64 * 1024];
-        let inner: Arc<CountingDev> = Arc::new(CountingDev::new(bytes));
-        let inner_trait: Arc<dyn BlockDevice> = inner.clone();
-        let dev = CachingDevice::new(inner_trait, 4096, 2);
-
-        let mut buf = vec![0u8; 4096];
-        dev.read_at(0, &mut buf).unwrap();
-        dev.read_at(4096, &mut buf).unwrap();
-        dev.read_at(8192, &mut buf).unwrap(); // evicts offset=0
-        dev.read_at(0, &mut buf).unwrap(); // miss — must re-read
-
-        assert_eq!(*inner.read_calls.lock().unwrap(), 4);
-    }
-
-    #[test]
-    fn caching_device_invalidates_on_write() {
-        let bytes = vec![0u8; 8192];
-        let inner: Arc<CountingDev> = Arc::new(CountingDev::new(bytes));
-        let inner_trait: Arc<dyn BlockDevice> = inner.clone();
-        let dev = CachingDevice::new(inner_trait, 4096, 4);
-
-        let mut buf = vec![0u8; 4096];
-        dev.read_at(0, &mut buf).unwrap(); // miss
-        dev.write_at(0, &[0xABu8; 4096]).unwrap(); // invalidates
-        dev.read_at(0, &mut buf).unwrap(); // miss again
-        assert_eq!(buf[0], 0xAB);
-
-        let (hits, misses) = dev.stats();
-        assert_eq!(hits, 0);
-        assert_eq!(misses, 2);
-    }
-
-    #[test]
-    fn caching_device_write_invalidates_overlapping_but_not_distant() {
-        let bytes = vec![0u8; 16 * 1024];
-        let inner: Arc<CountingDev> = Arc::new(CountingDev::new(bytes));
-        let inner_trait: Arc<dyn BlockDevice> = inner.clone();
-        let dev = CachingDevice::new(inner_trait, 4096, 4);
-
-        let mut buf = vec![0u8; 4096];
-        dev.read_at(0, &mut buf).unwrap();
-        dev.read_at(4096, &mut buf).unwrap();
-        dev.read_at(8192, &mut buf).unwrap();
-        dev.read_at(12288, &mut buf).unwrap();
-        assert_eq!(*inner.read_calls.lock().unwrap(), 4);
-
-        // Write into block 1 only — blocks 0, 2, 3 should stay cached.
-        dev.write_at(4096, &[0x11u8; 4096]).unwrap();
-
-        dev.read_at(0, &mut buf).unwrap(); // hit
-        dev.read_at(8192, &mut buf).unwrap(); // hit
-        dev.read_at(12288, &mut buf).unwrap(); // hit
-        dev.read_at(4096, &mut buf).unwrap(); // miss (was invalidated)
-
-        assert_eq!(*inner.read_calls.lock().unwrap(), 5);
+    fn a_request_past_the_end_is_refused_not_wrapped() {
+        let dev = AlignedDevice::new(Strict(Mutex::new(vec![0; 1024])), SECTOR as u32);
+        let mut buf = [0u8; 4];
+        assert!(dev.read_at(1022, &mut buf).is_err());
+        assert!(dev.write_at(1022, &buf).is_err());
+        assert!(dev.read_at(u64::MAX - 1, &mut buf).is_err());
     }
 }

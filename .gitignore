@@ -12,6 +12,7 @@ Cargo.lock.bak
 *.swp
 
 # Test artifacts
+tmp/
 test-disks/*.img
 test-disks/[0-9]*/
 test-disks/test-run/
@@ -24,3 +25,18 @@ test-disks/test-run/
 .qemu/
 **/.vagrant/
 .claude/
+
+# fs-linux-test-harness shared directory (the fixture builder's images on
+# their way out of the VM).
+.vm-share/
+
+# chore fingerprint cache (sources:/generates: checksums). Derived data.
+.chore/
+
+# Build output. `chore staticlib` writes the archive and headers here for a
+# consumer to copy out of (`chore artifact` prints this directory).
+/dist/
+
+# A local [patch] of rust-fs-core onto the sibling checkout
+# (docs/developing-against-core.md). Never committed.
+/.cargo/config.toml

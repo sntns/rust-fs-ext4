@@ -1,7 +1,7 @@
 //! Read file (or directory) contents using extent traversal.
 //!
 //! Composes `inode::Inode` + `extent::lookup` + `block_io::BlockDevice` into
-//! a Read/Seek-style API. Phase 1 read-only.
+//! a Read/Seek-style API. Reads only; writes go through `Filesystem`.
 
 use crate::error::{Error, Result};
 use crate::extent;
@@ -9,6 +9,33 @@ use crate::fs::Filesystem;
 use crate::indirect;
 use crate::inline_data;
 use crate::inode::{Inode, InodeFlags};
+
+/// Refuse an encrypted inode's contents (#76).
+///
+/// `EXT4_ENCRYPT_FL` marks a file whose data, or a symlink whose target, is
+/// fscrypt ciphertext. This driver holds no key, and the one wrong answer is
+/// handing the ciphertext back as the contents. A directory's blocks are not
+/// encrypted, only the names inside them, so a directory passes here and is
+/// refused where names are compared or listed.
+pub fn refuse_encrypted(inode: &Inode) -> Result<()> {
+    if inode.flags & InodeFlags::ENCRYPT.bits() != 0 && !inode.is_dir() {
+        return Err(Error::Unsupported(
+            "the file is encrypted (EXT4_ENCRYPT_FL) and this driver holds no key",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an encrypted directory's entry names (#76): they are ciphertext,
+/// so neither a lookup by name nor a listing can give a true answer.
+pub fn refuse_encrypted_names(dir: &Inode) -> Result<()> {
+    if dir.flags & InodeFlags::ENCRYPT.bits() != 0 {
+        return Err(Error::Unsupported(
+            "the directory's names are encrypted (EXT4_ENCRYPT_FL) and this driver holds no key",
+        ));
+    }
+    Ok(())
+}
 
 /// Read up to `length` bytes from `inode` starting at byte `offset`.
 /// Returns the actual number of bytes read (may be less than requested
@@ -27,6 +54,7 @@ pub fn read(
     length: u64,
     out: &mut [u8],
 ) -> Result<u64> {
+    refuse_encrypted(inode)?;
     if length == 0 || out.is_empty() {
         return Ok(0);
     }
@@ -131,6 +159,20 @@ pub fn read(
 /// the raw inode bytes (needed to read the in-inode xattr region holding
 /// data overflow).
 pub fn read_all(fs: &Filesystem, inode: &Inode) -> Result<Vec<u8>> {
+    // A whole-file read materialises the file, so it cannot need more
+    // memory than the filesystem has bytes. `inode.size` is
+    // `join32(i_size_high, i_size_lo)` straight off the disk with
+    // nothing comparing it to anything: setting `i_size_high` on a file
+    // in a 4 MiB image reached `memory allocation of
+    // 2305843009213694048 bytes failed` and took the process down --
+    // `handle_alloc_error` aborts, so `ffi_guard`'s `catch_unwind`
+    // never sees it. The ceiling is checked and device-bounded (#321):
+    // a saturating product of a forged `blocks_count` admitted terabytes.
+    if inode.size > fs.byte_ceiling()? {
+        return Err(Error::Corrupt(
+            "reading this file whole would need more memory than the filesystem has bytes",
+        ));
+    }
     let size = inode.size as usize;
     let mut buf = vec![0u8; size];
     let n = read(fs, inode, 0, size as u64, &mut buf)?;
@@ -142,6 +184,7 @@ pub fn read_all(fs: &Filesystem, inode: &Inode) -> Result<Vec<u8>> {
 /// `EXT4_INLINE_DATA_FL` set — needs the raw on-disk inode bytes since the
 /// data overflow lives in the in-inode xattr region.
 pub fn read_inline(fs: &Filesystem, inode: &Inode, inode_raw: &[u8]) -> Result<Vec<u8>> {
+    refuse_encrypted(inode)?;
     inline_data::read_all(
         fs.dev.as_ref(),
         inode,
@@ -162,6 +205,7 @@ pub fn read_with_raw(
     length: u64,
     out: &mut [u8],
 ) -> Result<u64> {
+    refuse_encrypted(inode)?;
     if (inode.flags & InodeFlags::INLINE_DATA.bits()) != 0 {
         let n = inline_data::read_range(
             fs.dev.as_ref(),
@@ -193,6 +237,7 @@ pub fn read_verified(
     length: u64,
     out: &mut [u8],
 ) -> Result<u64> {
+    refuse_encrypted(inode)?;
     if length == 0 || out.is_empty() {
         return Ok(0);
     }
@@ -303,6 +348,7 @@ pub fn read_with_raw_verified(
     length: u64,
     out: &mut [u8],
 ) -> Result<u64> {
+    refuse_encrypted(inode)?;
     if (inode.flags & InodeFlags::INLINE_DATA.bits()) != 0 {
         let n = inline_data::read_range(
             fs.dev.as_ref(),

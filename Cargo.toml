@@ -1,28 +1,79 @@
 [package]
-name = "am-fs-ext4"
-version = "0.4.0"
+name = "rust-fs-ext4"
+version = "0.8.0"
 edition = "2021"
+# The oldest toolchain the library and the binaries build on, so an older
+# one gets cargo's "requires rustc" message rather than a wall of E0658.
+# Measured, not guessed: 1.89 is where `File::try_lock` and
+# `TryLockError` stabilised, which rust-fs-core 0.3.15's `cli` feature
+# uses, and 1.88 refuses them (E0658 `file_lock`). The dev-
+# dependencies need newer (ordered-float, via saphyr, wants 1.90); they
+# never reach a consumer. `chore check:msrv` builds at exactly this version.
+rust-version = "1.89"
 license = "MIT"
 description = "Pure-Rust ext4 filesystem driver. Exposes a C ABI (fs_ext4_*) suitable for FFI from C/C++/Go/etc."
-repository = "https://github.com/christhomas/rust-fs-ext4"
+repository = "https://github.com/antimatter-studios/rust-fs-ext4"
+
+# The fuzz crate is its own package, on its own toolchain, and is not
+# part of this one. Without this, `cargo package` and `cargo publish`
+# try to include it and fail on the nightly-only dependency.
+exclude = ["fuzz"]
+
+# WHAT THE RELEASE TARBALL SHIPS, read by rust-fs-core's package-cli
+# (`../rust-fs-core/scripts/package-cli.sh`, run by release.yml's called release-cli
+# workflow and by ci.yml's `cli` job). Every dotted name the multi-call
+# binary answers to, and its man section; the binary's own `generate
+# names` must list exactly these. The CAVEATS are packaging/CAVEATS, the
+# default.
+[package.metadata.package-cli]
+names = { "mkfs.ext4" = 8, "fsck.ext4" = 8, "fs.ext4" = 1 }
+licenses = ["LICENSE"]
+
+# `tests/support` is a member so clippy reaches it: clippy lints
+# workspace members only, so as a bare path dependency no flag on the
+# root invocation linted it (#410). The root package stays the default
+# member, so a plain `cargo test` or `cargo build` is unchanged; `chore
+# lint` passes `--workspace`. `fuzz` is excluded because it is its own
+# package, on its own toolchain, with its own lock file. The root
+# package is a member without being listed, and must not be: `"."`
+# would contain `fuzz` and override the exclusion.
+[workspace]
+members = ["tests/support"]
+exclude = ["fuzz"]
+
+# The name this crate had on crates.io: the semver check's baseline until
+# a release exists under the new one (rust-fs-core's semver-check.sh).
+[package.metadata.semver]
+former-name = "am-fs-ext4"
 
 [lib]
 name = "fs_ext4"
 crate-type = ["staticlib", "rlib"]
 
-# Standalone CLI tool. Cross-platform — builds + runs identically on
-# Linux/macOS/Windows because it only depends on this crate's own
-# pure-Rust format path. Distributed via Homebrew tap on macOS and
-# `cargo install` everywhere; embedders that route formatting through
-# their own UI (e.g. an FSKit `startFormat` handler) call
-# `format_filesystem()` directly instead of shelling out to this binary.
+# THE COMMAND-LINE TOOLS: one multi-call binary, named for the repository.
+# It dispatches on argv[0], the way busybox and e2fsprogs do, so the
+# release step installs it once as `rust-fs-ext4` and links `mkfs.ext4`,
+# `fsck.ext4` and `fs.ext4` to it (cargo refuses a dot in a target name,
+# so the dotted names are never cargo's). `rust-fs-ext4 <tool> ...` is the
+# form nothing else on PATH can shadow, and `cargo run --features cli --
+# mkfs ...` works before anything is installed.
 #
-# Binary name uses underscore — Cargo's bin name field doesn't accept
-# dots. Homebrew formula symlinks /usr/local/bin/mkfs.ext4 → mkfs_ext4
-# at install time so the user-visible command matches Linux convention.
+# BEHIND THE `cli` FEATURE, so the static library a consumer links gains no
+# dependency from the tools: `required-features` keeps the target out of a
+# build that did not ask for it. scripts/test.sh, `chore lint` and
+# scripts/msrv.sh ask for it, so the tests, clippy and the MSRV build all
+# reach it.
 [[bin]]
-name = "mkfs_ext4"
-path = "src/bin/mkfs_ext4.rs"
+name = "rust-fs-ext4"
+path = "src/cli/main.rs"
+required-features = ["cli"]
+
+[features]
+# The command-line tools and nothing else. The plumbing they share --
+# dispatch, --version, doctor, the output contract, man pages and
+# completions -- is rust-fs-core's `cli` feature, turned on only here, so
+# the static library gains nothing. clap is MIT/Apache-2.0.
+cli = ["dep:clap", "dep:same-file", "dep:tempfile", "rust-fs-core/cli"]
 
 [dependencies]
 crc32c = "0.6"
@@ -30,15 +81,56 @@ bitflags = "2"
 unicode-normalization = "0.1"
 caseless = "0.2"
 # Block-device trait surface shared with sister crates (qcow2 reader,
-# partition probe, future fs-* drivers). Local path dep until both crates
-# publish; flip to a published version on the first crates.io release.
-# Strictly additive — ext4's existing BlockDevice trait is unchanged; this
-# adds a bridge module so external `fs_core::BlockDevice` implementors
-# (a `Qcow2Reader`, a `SliceReader`, etc.) can be mounted by ext4.
-am-fs-core = { version = "0.2" }
+# partition probe, future fs-* drivers). Strictly additive -- ext4's
+# existing BlockDevice trait is unchanged; this adds a bridge module so
+# external `fs_core::BlockDevice` implementors (a `Qcow2Reader`, a
+# `SliceReader`, etc.) can be mounted by ext4.
+#
+# BY VERSION ONLY: the 0.5 releases from the registry, the ones with the
+# three API layers (the `layers` feature), and no path, as every driver in
+# the family pins it (rust-fs-core's docs/three-layers.md). The lock file
+# holds the exact release CI tests, and a consumer using several drivers
+# resolves one 0.5 core for all of them. The sibling checkout `chore
+# siblings` keeps at FS_CORE_REF is for core's scripts, not for cargo.
+# Building against an unreleased core is a local override that is never
+# committed: docs/developing-against-core.md says how.
+rust-fs-core = { version = "=0.5.1", features = ["layers"] }
+# The three layers' evidence types are serde data, so the candidate detail
+# this crate defines derives them too. MIT/Apache-2.0, already in the tree
+# through rust-fs-core's `layers` feature.
+serde = { version = "1", features = ["derive"] }
+# The command-line tools' argument parser, behind the `cli` feature (see
+# the `rust-fs-ext4` target above). No derive: the builder API keeps each
+# tool's command a function the man pages and completions can be made from.
+clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+# MIT/Unlicense; compares opened identities on Unix and Windows.
+same-file = { version = "1.0.6", optional = true }
+# MIT/Apache-2.0; anonymous stdin spools obey TMPDIR and close without residue.
+tempfile = { version = "3.27.0", optional = true, default-features = false }
 
 [dev-dependencies]
 hex = "0.4"
+# YAML parser for tests/ci_profile.rs, which reads .github/workflows/ci.yml
+# and refuses if the debug run that lets the PR gate see an arithmetic
+# overflow has been removed or disabled. That guard hand-rolled its own
+# scanner and needed a helper per piece of ordinary grammar -- comments,
+# quoted keys, block scalar styles, indentation, whole trigger names --
+# all of which a YAML parser already has. Pure Rust, YAML 1.2 (so
+# GitHub's `on:` key stays the string `on` and is not folded into a
+# boolean), MIT/Apache-2.0, and no C to transpile -- unlike serde_yaml,
+# which is deprecated and wraps unsafe-libyaml. Test-only: it never
+# reaches a consumer of this crate.
+saphyr = "0.0.12"
+
+# The fixture, oracle and VM helpers are Unix-host code (they spawn
+# processes and build paths from raw bytes), and nothing that runs on the
+# browser build uses them: tests/wasm.rs is the one test built for it.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
+fs-ext4-test-support = { path = "tests/support" }
+# Host extended attributes for tests/cli_transfer_xattrs_kernel.rs: the
+# same crate and version rust-fs-core's transfer reads and writes them
+# with, so it adds nothing to the lockfile but this edge.
+xattr = { version = "1.6.1", default-features = false }
 
 [profile.release]
 lto = true
@@ -46,6 +138,20 @@ codegen-units = 1
 opt-level = 3
 panic = "unwind"  # required for catch_unwind at FFI boundary (see src/capi.rs)
 
+[profile.test-opt]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [profile.dev]
 opt-level = 1
 panic = "unwind"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"
+
+# The browser build's tests (tests/wasm.rs, `chore test:wasm`) run under
+# wasm-bindgen-test in Node. MIT/Apache-2.0, test-only, and only for the
+# target that needs it: no other build resolves it.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"

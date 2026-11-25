@@ -11,20 +11,21 @@
 
 use fs_ext4::capi::*;
 use std::ffi::CString;
-use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::raw::{c_int, c_void};
-use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
+const IMAGE: &str = "ext4-basic.img";
 
 // ---------------------------------------------------------------------------
-// Mutex<Vec<u8>>-backed device with a dirty-flag we can probe from tests.
+// File-backed device with a dirty-flag we can probe from tests.
 // ---------------------------------------------------------------------------
 
 struct DevCtx {
-    /// Raw device bytes.
-    bytes: Mutex<Vec<u8>>,
+    file: Mutex<File>,
+    size: u64,
     /// Number of times the write callback has been invoked.
     writes: Mutex<u64>,
     /// Number of times the flush callback has been invoked.
@@ -36,18 +37,19 @@ extern "C" fn read_cb(ctx: *mut c_void, buf: *mut c_void, offset: u64, length: u
         return 1;
     }
     let dev = unsafe { &*(ctx as *const DevCtx) };
-    let bytes = dev.bytes.lock().unwrap();
-    let end = (offset as usize).checked_add(length as usize);
-    let Some(end) = end else { return 2 };
-    if end > bytes.len() {
+    if offset.checked_add(length).is_none_or(|end| end > dev.size) {
         return 3;
     }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr().add(offset as usize),
-            buf as *mut u8,
-            length as usize,
-        );
+    let Ok(length) = usize::try_from(length) else {
+        return 2;
+    };
+    let mut file = dev.file.lock().unwrap();
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return 4;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, length) };
+    if file.read_exact(bytes).is_err() {
+        return 4;
     }
     0
 }
@@ -57,18 +59,19 @@ extern "C" fn write_cb(ctx: *mut c_void, buf: *const c_void, offset: u64, length
         return 1;
     }
     let dev = unsafe { &*(ctx as *const DevCtx) };
-    let mut bytes = dev.bytes.lock().unwrap();
-    let end = (offset as usize).checked_add(length as usize);
-    let Some(end) = end else { return 2 };
-    if end > bytes.len() {
+    if offset.checked_add(length).is_none_or(|end| end > dev.size) {
         return 3;
     }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            buf as *const u8,
-            bytes.as_mut_ptr().add(offset as usize),
-            length as usize,
-        );
+    let Ok(length) = usize::try_from(length) else {
+        return 2;
+    };
+    let mut file = dev.file.lock().unwrap();
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return 4;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buf as *const u8, length) };
+    if file.write_all(bytes).is_err() {
+        return 4;
     }
     *dev.writes.lock().unwrap() += 1;
     0
@@ -79,29 +82,42 @@ extern "C" fn flush_cb(ctx: *mut c_void) -> c_int {
         return 1;
     }
     let dev = unsafe { &*(ctx as *const DevCtx) };
+    if dev.file.lock().unwrap().flush().is_err() {
+        return 2;
+    }
     *dev.flushes.lock().unwrap() += 1;
     0
 }
 
-fn fixture_available() -> bool {
-    Path::new(IMAGE).exists()
-}
-
 fn fresh_dev() -> Arc<DevCtx> {
-    let bytes = fs::read(IMAGE).expect("read fixture image");
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let source = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), IMAGE);
+    let path = fs_ext4_test_support::temp_path!(
+        "capi-callback-rw-{}-{}.img",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    std::fs::copy(&source, &path)
+        .unwrap_or_else(|e| panic!("copy fixture image {source} to {path}: {e}"));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open scratch image {path}: {e}"));
+    let size = file.metadata().expect("scratch image metadata").len();
     Arc::new(DevCtx {
-        bytes: Mutex::new(bytes),
+        file: Mutex::new(file),
+        size,
         writes: Mutex::new(0),
         flushes: Mutex::new(0),
     })
 }
 
 fn make_cfg(dev: &Arc<DevCtx>, with_write: bool, with_flush: bool) -> fs_ext4_blockdev_cfg_t {
-    let size = dev.bytes.lock().unwrap().len() as u64;
     fs_ext4_blockdev_cfg_t {
         read: Some(read_cb),
         context: Arc::as_ptr(dev) as *mut c_void,
-        size_bytes: size,
+        size_bytes: dev.size,
         block_size: 512,
         write: if with_write { Some(write_cb) } else { None },
         flush: if with_flush { Some(flush_cb) } else { None },
@@ -114,12 +130,6 @@ fn make_cfg(dev: &Arc<DevCtx>, with_write: bool, with_flush: bool) -> fs_ext4_bl
 
 #[test]
 fn rw_callback_create_write_stat_read_unlink_round_trip() {
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true);
 
@@ -180,12 +190,6 @@ fn rw_callback_create_write_stat_read_unlink_round_trip() {
 
 #[test]
 fn rw_callback_mkdir_rmdir_chmod_rename() {
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, false);
 
@@ -223,12 +227,6 @@ fn rw_callback_mkdir_rmdir_chmod_rename() {
 
 #[test]
 fn rw_callback_null_write_callback_returns_einval() {
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     // read present, write missing — must reject.
     let cfg = make_cfg(&dev, false, false);
@@ -242,11 +240,10 @@ fn rw_callback_null_read_callback_returns_einval() {
     let dev = fresh_dev();
     // Manually build a cfg with read=None, write=Some — still EINVAL because
     // read is required even on RW mounts.
-    let size = dev.bytes.lock().unwrap().len() as u64;
     let cfg = fs_ext4_blockdev_cfg_t {
         read: None,
         context: Arc::as_ptr(&dev) as *mut c_void,
-        size_bytes: size,
+        size_bytes: dev.size,
         block_size: 512,
         write: Some(write_cb),
         flush: None,
@@ -268,12 +265,6 @@ fn ro_callback_mount_unchanged_still_rejects_writes() {
     // The OLD `fs_ext4_mount_with_callbacks` is a documented RO entry point.
     // It must still mount RO even if the cfg has a write callback — and it
     // must still refuse mutating ops.
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true); // write+flush set, but RO call should ignore them.
 
@@ -297,12 +288,6 @@ fn rw_callback_writes_are_persisted_across_remount() {
     // Mutate via RW callback → unmount → re-mount RO and verify the change
     // survives. Confirms the write callback's bytes really land in the
     // backing buffer (not just an in-memory cache).
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     let path = CString::new("/persist.txt").unwrap();
     let payload: &[u8] = b"persist me";

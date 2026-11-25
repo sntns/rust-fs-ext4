@@ -3,7 +3,6 @@
 use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::fs;
-use std::io::Write;
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -13,14 +12,11 @@ const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.im
 fn scratch(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dst = PathBuf::from(format!(
-        "/tmp/fs_ext4_capi_symlink_{tag}_{}_{n}.img",
+    let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
+        "fs_ext4_capi_symlink_{tag}_{}_{n}.img",
         std::process::id()
     ));
-    let bytes = fs::read(SRC).expect("read src");
-    let mut out = fs::File::create(&dst).expect("create");
-    out.write_all(&bytes).expect("write");
-    out.flush().expect("flush");
+    fs::copy(SRC, &dst).expect("copy src");
     dst
 }
 
@@ -51,12 +47,12 @@ fn symlink_creates_link_with_target() {
     assert_eq!(attr.size, "/etc/hosts".len() as u64);
     assert_eq!(attr.inode, ino);
 
-    // readlink writes the target NUL-terminated into buf; returns 0 on success.
+    // readlink writes the target NUL-terminated into buf; returns its length.
     let mut buf = [0u8; 256];
     let rc =
         unsafe { fs_ext4_readlink(fs_h, link_c.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
-    assert_eq!(rc, 0, "readlink returned {rc}");
     let nul = buf.iter().position(|&b| b == 0).expect("NUL terminator");
+    assert_eq!(rc as usize, nul, "readlink returned {rc}");
     assert_eq!(&buf[..nul], b"/etc/hosts");
 
     unsafe { fs_ext4_umount(fs_h) };
@@ -85,8 +81,8 @@ fn symlink_survives_remount_with_csum() {
     let mut buf = [0u8; 64];
     let rc =
         unsafe { fs_ext4_readlink(fs2, link_c.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
-    assert_eq!(rc, 0);
     let nul = buf.iter().position(|&b| b == 0).expect("NUL terminator");
+    assert_eq!(rc as usize, nul);
     assert_eq!(&buf[..nul], b"../relative/path");
     unsafe { fs_ext4_umount(fs2) };
     let _ = fs::remove_file(&img);
@@ -135,8 +131,8 @@ fn symlink_slow_path_target_over_60_bytes_roundtrips() {
     let mut buf = [0u8; 512];
     let rc =
         unsafe { fs_ext4_readlink(fs_h, link_c.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
-    assert_eq!(rc, 0);
     let nul = buf.iter().position(|&b| b == 0).expect("NUL terminator");
+    assert_eq!(rc as usize, nul);
     assert_eq!(&buf[..nul], long_target.as_bytes());
 
     unsafe { fs_ext4_umount(fs_h) };
@@ -150,8 +146,8 @@ fn symlink_slow_path_target_over_60_bytes_roundtrips() {
     let mut buf = [0u8; 512];
     let rc =
         unsafe { fs_ext4_readlink(fs2, link_c.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
-    assert_eq!(rc, 0);
     let nul = buf.iter().position(|&b| b == 0).expect("NUL terminator");
+    assert_eq!(rc as usize, nul);
     assert_eq!(&buf[..nul], long_target.as_bytes());
     unsafe { fs_ext4_umount(fs2) };
 

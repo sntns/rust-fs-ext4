@@ -9,10 +9,8 @@
 //! Ext4 mkfs enables metadata_csum + metadata_csum_seed but lays down no
 //! journal, and 1 KiB blocks use the first_data_block=1 layout (see the mkfs
 //! bitmap fix). So this stresses the checksum write paths at the small block
-//! size, journal-less. Each test formats its own fresh image and leaves it in
-//! /tmp for the real-Linux oracle:
-//!
-//!   scripts/vm-e2fsck.sh /tmp/fs_ext4_mk1kop_*.img
+//! size, journal-less. Each test formats its own fresh image, and `e2fsck -fn`
+//! must pass on it after the ops (`RFE_KEEP_IMAGES=1` keeps it).
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::fs::Filesystem;
@@ -27,12 +25,13 @@ const UUID: [u8; 16] = [
 ];
 
 /// Format a fresh 8 MiB / 1 KiB-block Ext4 image and return its path.
-fn mkfs_1k(tag: &str) -> Option<String> {
+fn mkfs_1k(tag: &str) -> String {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = format!("/tmp/fs_ext4_mk1kop_{tag}_{}_{n}.img", std::process::id());
+    let path =
+        fs_ext4_test_support::temp_path!("fs_ext4_mk1kop_{tag}_{}_{n}.img", std::process::id());
     {
-        // Image setup must not fail silently: a /tmp/disk/permission error here
+        // Image setup must not fail silently: a scratch-disk/permission error here
         // should fail the test loudly, not make the coverage vanish via an
         // early `return` in the callers.
         let f = std::fs::File::create(&path).expect("create 1k image file");
@@ -44,7 +43,7 @@ fn mkfs_1k(tag: &str) -> Option<String> {
             .expect("format_filesystem 1k");
         dev.flush().expect("flush");
     }
-    Some(path)
+    path
 }
 
 fn rw(path: &str) -> Filesystem {
@@ -64,6 +63,7 @@ fn done(path: &str, tag: &str) {
             report.anomalies
         );
     }
+    fs_ext4_test_support::assert_e2fsck_clean(path, tag);
     if std::env::var_os("RFE_KEEP_IMAGES").is_some() {
         eprintln!("[{tag}] image: {path}");
     } else {
@@ -73,9 +73,7 @@ fn done(path: &str, tag: &str) {
 
 #[test]
 fn mk1k_file_write_truncate() {
-    let Some(p) = mkfs_1k("write_trunc") else {
-        return;
-    };
+    let p = mkfs_1k("write_trunc");
     {
         let fs = rw(&p);
         let ino = fs.apply_create("/f", 0o644).expect("create");
@@ -89,9 +87,7 @@ fn mk1k_file_write_truncate() {
 
 #[test]
 fn mk1k_multiblock_write() {
-    let Some(p) = mkfs_1k("multiblock") else {
-        return;
-    };
+    let p = mkfs_1k("multiblock");
     {
         let fs = rw(&p);
         fs.apply_create("/big", 0o644).expect("create");
@@ -103,9 +99,7 @@ fn mk1k_multiblock_write() {
 
 #[test]
 fn mk1k_mkdir_rmdir() {
-    let Some(p) = mkfs_1k("mkdir_rmdir") else {
-        return;
-    };
+    let p = mkfs_1k("mkdir_rmdir");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/d1", 0o755).expect("mkdir d1");
@@ -118,9 +112,7 @@ fn mk1k_mkdir_rmdir() {
 
 #[test]
 fn mk1k_hardlink_unlink() {
-    let Some(p) = mkfs_1k("hardlink") else {
-        return;
-    };
+    let p = mkfs_1k("hardlink");
     {
         let fs = rw(&p);
         fs.apply_create("/a", 0o644).expect("create a");
@@ -132,7 +124,7 @@ fn mk1k_hardlink_unlink() {
 
 #[test]
 fn mk1k_rename() {
-    let Some(p) = mkfs_1k("rename") else { return };
+    let p = mkfs_1k("rename");
     {
         let fs = rw(&p);
         fs.apply_create("/x", 0o644).expect("create x");
@@ -146,9 +138,7 @@ fn mk1k_rename() {
 
 #[test]
 fn mk1k_chmod_chown() {
-    let Some(p) = mkfs_1k("chmod_chown") else {
-        return;
-    };
+    let p = mkfs_1k("chmod_chown");
     {
         let fs = rw(&p);
         fs.apply_create("/m", 0o644).expect("create");
@@ -158,23 +148,14 @@ fn mk1k_chmod_chown() {
     done(&p, "chmod_chown");
 }
 
-/// KNOWN BUG (deferred) — at 1 KiB blocks, an external xattr block that
-/// coexists with an inline xattr on the same inode is rejected by e2fsck.
-/// After setxattr(small, inline) + setxattr(big → external block) +
-/// removexattr(small), e2fsck reports "i_file_acl ... should be zero",
-/// "i_blocks ... should be 0" and frees the external block (EXIT 4) — it does
-/// not accept the block as a valid xattr block. The driver's inode still
-/// points at it correctly (i_file_acl stays set), so the external block's
-/// on-disk encoding (or its interaction with the co-resident inline entry) is
-/// wrong at 1 KiB. The external-only sibling `mk1k_removexattr_last_frees_block`
-/// is e2fsck-clean, and the identical sequence is clean at 4 KiB
-/// (repro_csum_seed_op_coverage::op_xattr_inline_and_external), so this is
-/// 1 KiB + co-resident-inline specific. Run with `--ignored`; verify via
-/// scripts/vm-e2fsck.sh.
+/// An external xattr block next to an inline xattr, then the inline one
+/// removed. This was ignored as a 1 KiB defect with "i_file_acl ... should be
+/// zero". The block was sound: mkfs sets no COMPAT_EXT_ATTR, and e2fsck
+/// ignores every xattr block on a volume without it. setxattr now sets the
+/// feature, as the kernel does (#88).
 #[test]
-#[ignore = "1 KiB: external xattr block coexisting with an inline xattr is rejected by e2fsck — see header"]
 fn mk1k_xattr_inline_external_remove() {
-    let Some(p) = mkfs_1k("xattr") else { return };
+    let p = mkfs_1k("xattr");
     {
         let fs = rw(&p);
         fs.apply_create("/x", 0o644).expect("create");
@@ -192,9 +173,7 @@ fn mk1k_xattr_inline_external_remove() {
 
 #[test]
 fn mk1k_removexattr_last_frees_block() {
-    let Some(p) = mkfs_1k("xattr_free") else {
-        return;
-    };
+    let p = mkfs_1k("xattr_free");
     {
         let fs = rw(&p);
         fs.apply_create("/xr", 0o644).expect("create");
@@ -210,9 +189,7 @@ fn mk1k_removexattr_last_frees_block() {
 
 #[test]
 fn mk1k_fallocate_variants() {
-    let Some(p) = mkfs_1k("fallocate") else {
-        return;
-    };
+    let p = mkfs_1k("fallocate");
     {
         let fs = rw(&p);
         let ino = fs.apply_create("/fa", 0o644).expect("create");
@@ -228,9 +205,7 @@ fn mk1k_fallocate_variants() {
 
 #[test]
 fn mk1k_slow_symlink_unlink() {
-    let Some(p) = mkfs_1k("slow_symlink") else {
-        return;
-    };
+    let p = mkfs_1k("slow_symlink");
     {
         let fs = rw(&p);
         let target = "/a/very/long/symlink/target/path/that/exceeds/sixty/bytes/for/sure/x";
@@ -242,7 +217,7 @@ fn mk1k_slow_symlink_unlink() {
 
 #[test]
 fn mk1k_htree_dir_growth() {
-    let Some(p) = mkfs_1k("htree") else { return };
+    let p = mkfs_1k("htree");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/h", 0o755).expect("mkdir h");
@@ -258,9 +233,7 @@ fn mk1k_htree_dir_growth() {
 
 #[test]
 fn mk1k_large_chunked_write() {
-    let Some(p) = mkfs_1k("large_chunked") else {
-        return;
-    };
+    let p = mkfs_1k("large_chunked");
     {
         let fs = rw(&p);
         fs.apply_create("/lc", 0o644).expect("create");
@@ -276,9 +249,7 @@ fn mk1k_large_chunked_write() {
 
 #[test]
 fn mk1k_fragmented_extent_tree() {
-    let Some(p) = mkfs_1k("frag_extents") else {
-        return;
-    };
+    let p = mkfs_1k("frag_extents");
     {
         let fs = rw(&p);
         fs.apply_create("/frag", 0o644).expect("create");

@@ -12,7 +12,6 @@ use fs_ext4::capi::*;
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
 use std::sync::Mutex;
 
 struct FileCtx {
@@ -115,15 +114,8 @@ const FT_REG_FILE: u8 = 1;
 ///
 /// Per-image entry points below call this and surface PASS/FAIL in the test name.
 fn run_round_trip(image_basename: &str) {
-    let src = format!(
-        "{}/test-disks/{}.img",
-        env!("CARGO_MANIFEST_DIR"),
-        image_basename
-    );
-    if !Path::new(&src).exists() {
-        eprintln!("SKIP {image_basename}: fixture missing at {src}");
-        return;
-    }
+    let src =
+        fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), &format!("{image_basename}.img"));
     let scratch = format!(
         "{}/test-disks/_smoke_{}.img",
         env!("CARGO_MANIFEST_DIR"),
@@ -281,20 +273,10 @@ fn ext4_inline() {
 fn ext4_largedir() {
     run_round_trip("ext4-largedir")
 }
-/// KNOWN LIMITATION — `fs_ext4_create` returns 0 with `errno=5 (EIO)` when
-/// adding a 516th entry to the root of `ext4-manyfiles.img`. Diagnosed via
-/// `fs_ext4_get_volume_info`:
-///   * 3572 / 4096 inodes free (plenty of inode capacity)
-///   * 2257 / 4096 blocks free (plenty of data capacity)
-///
-/// So this is not exhaustion — it's an htree-directory write edge case in
-/// the underlying rust-fs-ext4 driver that the smaller fixtures don't hit.
-/// Run explicitly with `--ignored` to reproduce.
-///
-/// TODO: investigate htree leaf insert path in rust-fs-ext4 around 500+
-/// entries; the crate's status table claims depth-1 inserts work.
+/// A kernel-grown 515-entry htree root: its dx_tail keeps the bytes of the
+/// dirent tail it had before it was indexed, which the driver used to verify
+/// as one and refuse every create and unlink with EIO (#233).
 #[test]
-#[ignore = "exposes htree-write bug at ~500-entry directories — see diagnostics in fn header"]
 fn ext4_manyfiles() {
     run_round_trip("ext4-manyfiles")
 }

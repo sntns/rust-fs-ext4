@@ -1,103 +1,885 @@
 name: CI
 
+# EVERY JOB RUNS CHORE TASKS, so a green local `chore test` is the same
+# evidence as a green run here (see the test contract at the top of
+# chores.yml):
+#
+#   unit         `chore test:unit` on a runner with NO fixtures: the tests
+#                that need no tool, no fixture and no VM, in the debug
+#                profile that traps an arithmetic overflow. That the job
+#                passes with test-disks/ empty is what proves the split.
+#   fixtures     `chore fixtures`: the kernel-made images, built in the
+#                fs-linux-test-harness VM under KVM on x86_64, and handed
+#                to the other jobs as an artifact (they are disk images,
+#                the same for every architecture).
+#   test         x86_64, where GitHub gives us KVM: `chore lint` and
+#                `chore test` — the whole gate, with EVERY e2fsprogs call,
+#                every kernel mount and every lwext4 call happening inside
+#                the harness VM. Nothing installs e2fsprogs on the runner,
+#                and the log shows `[oracle vm]` / `[kernel vm]` for each
+#                one. The guest also builds lwext4 (a third ext4
+#                implementation, at the commit scripts/vm-setup.sh pins)
+#                so `chore test:lwext4` can cross-validate against it.
+#   test-arm64   aarch64 matters on its own (c_char is unsigned there, and
+#                Apple Silicon hosts run on it) but GitHub's arm64
+#                runners have NO KVM, so no VM can run: this job runs the
+#                tiers that need none — lint, the unit tier, and the
+#                fixture-reading tests. The tool, kernel and lwext4
+#                oracles are architecture-independent (they read the same
+#                images) and are covered by `test`; so are the script
+#                tests, which check the tree rather than the machine.
+#   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
+#                the guest. That is how a macOS host runs a Linux suite,
+#                and this job is what keeps that path working.
+#   wasm         `chore test:wasm`: the browser build (wasm32-unknown-
+#                unknown) RUN under wasm-bindgen-test in Node, because std
+#                there compiles clock and process-ID calls that panic at
+#                run time -- a build-only check cannot see them.
+#   semver       `chore check:semver`: the public API against the newest
+#                crates.io release, refusing a break Cargo.toml's version
+#                does not declare (#120).
+#   msrv         `chore check:msrv`: the library and the binaries built on
+#                the toolchain Cargo.toml's `rust-version` names, so the
+#                declared minimum stays the true one.
+#   cli          `chore cli:install` then `chore test:cli`: the command-line
+#                tools built in release mode, staged under every name first
+#                on PATH, and tested AS INSTALLED -- `rust-fs-ext4 doctor`
+#                first, then tests/cli/*.sh. A change that breaks a tool
+#                fails the pull request, not the release. No VM: what
+#                e2fsprogs makes of the tools' output is judged in the
+#                oracle tier (tests/cli_*_oracle.rs).
+#   provenance   `chore check:provenance`: no tracked file names a Linux
+#                kernel or e2fsprogs function, internal macro or source
+#                path (AGENTS.md, "Clean room"). No toolchain, no fixtures:
+#                it reads the tree, so it answers in seconds.
+#   ci-ok        the one required check: green only when every job above
+#                ran and succeeded (failed, cancelled OR skipped fails it).
+#
+# THE OUTPUT BUDGET IS IN THE TASKS, so it is in this workflow too. Each
+# tier writes its full output to tmp/logs/<tier>.log and prints a verdict;
+# a tier that prints more than its measured budget FAILS (exit 65), which
+# is how a job that starts emitting thousands of lines turns red here
+# rather than being noticed by whoever scrolls it next. See the budget
+# table at the top of chores.yml, and the harness README's "Output: quiet
+# by default, --verbose on request". Nothing extra is needed in this file:
+# every job already runs chore tasks, which is the whole point of them.
+#
+# The logs are uploaded as artefacts (tier-logs-<job>), `if: always()`
+# because the run worth reading is the one that failed -- AND only once
+# the job's first tier step has run (`steps.tier.outcome != 'skipped'`).
+# A job that dies in setup, the sibling checkout, the fixture download
+# or lint has written no tmp/logs/*.log, and an upload refusing an
+# empty path would add a second red step hiding the real cause (#306).
+# tests/ci_profile.rs holds every such upload to that.
+
 on:
   push:
     branches: [main]
     tags: ['v*']
+  # NO BRANCH FILTER ON PULL REQUESTS (#132). With `branches: [main]` a
+  # pull request based on anything else ran no CI at all — and still
+  # collected its review-bot ticks, so it read as verified. This
+  # repository stacks pull requests routinely, a fix branched off a fix
+  # that has not merged yet, which is exactly the case that got nothing:
+  # PR #131 came back with one check, its review bot, against PR #130's
+  # three on the same day.
   pull_request:
-    branches: [main]
+  # The merge queue's run: main plus the queued pull requests, the run that
+  # decides whether they land. The queue reads ci-ok only from a workflow
+  # that triggers here.
+  merge_group:
+  # A full run of any branch on request: the full profile, every VM,
+  # fixture and oracle job.
+  workflow_dispatch:
+
+# A newer push to a pull request cancels the run still going on the older one,
+# except while the pull request's title starts "red:". Such a pull request
+# holds only its failing test, and its run is the red evidence. Every PR runs
+# the full profile (scripts/ci-plan.sh); the red title only keeps that run
+# uncancelled, so a kernel or VM test fails there, and it gets a group
+# of its own commit and is never cancelled, so the push that adds the fix, made
+# after the title loses "red:", cannot cancel it either. Keyed by the commit
+# because GitHub keeps one pending run per group even with cancelling off: a
+# second push sharing the group would replace the red run while it waits.
+# tests/scripts/test-red-runs-uncancelled.sh fails if that stops being so.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}${{ startsWith(github.event.pull_request.title, 'red:') && format('-red-{0}', github.event.pull_request.head.sha) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, 'red:') }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CHORE_VERSION: "0.11.0"
+  FLTH_RESOURCE_PROFILE: low
+  # The jobs gated by the full profile (`if: needs.changes.outputs.profile
+  # == 'full'`), declared to rust-fs-core's ci-gate.sh, which `chore lint`
+  # runs in the unit job. ci-gate recognises only the `code` path gate on its
+  # own, so a profile-gated job in ci-ok's needs must be named here. They stay
+  # in ci-ok's needs: scripts/ci-ok.sh still judges each one's result, and
+  # accepts docs-only skips only for fixture/VM jobs; any other skip, failure
+  # or cancellation still fails ci-ok.
+  # The gate jobs that carry the same `if:` as their job, and ci-ok-gate (it only
+  # picks ci-ok's runner and carries `if: always()` like ci-ok), are named too.
+  CI_GATE_NON_GATING: fixtures wasm cli fixtures-gate wasm-gate cli-gate ci-ok-gate
 
 jobs:
-  test:
-    name: test-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
+  # Is this change documentation-only? rust-fs-core's
+  # scripts/code-changed.sh reads the change's paths and says false only when
+  # every one is documentation. The change is the pull request's diff, the
+  # merge queue group's (its base_sha to its head_sha: what the queue is about
+  # to land), or a push to main's (before to after); a tag or a push it cannot
+  # diff runs everything. The jobs that boot the VM or read its fixtures
+  # (test, test-arm64, suite-in-vm) run only when the answer is true, and
+  # ci-ok accepts their skip when, and only when, it is false.
+  changes-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  changes:
+    name: changes (does this need the full pipeline?)
+    needs: changes-gate
+    runs-on: ${{ needs.changes-gate.outputs.runner }}
+    outputs:
+      code: ${{ steps.c.outputs.code }}
+      # Full for every event (scripts/ci-plan.sh).
+      profile: ${{ steps.plan.outputs.profile }}
     steps:
       - uses: actions/checkout@v4
-      # The crate has a path dep on am-fs-core (../rust-fs-core).
-      # Clone the sibling repo alongside so cargo can resolve it.
-      # Anonymous HTTPS clone — rust-fs-core is public.
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.2 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        with:
+          fetch-depth: 0
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Grade the profile planner and verdict
+        run: bash scripts/test-ci-plan.sh
+      - name: Plan the profile
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          profile="$(bash scripts/ci-plan.sh "$EVENT" "$TITLE")"
+          echo "profile=$profile ($EVENT)"
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+      - name: Classify the change
+        id: c
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PULL_BASE: ${{ github.event.pull_request.base.sha }}
+          PULL_HEAD: ${{ github.event.pull_request.head.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          range=
+          case "$EVENT" in
+            pull_request) range="$PULL_BASE...$PULL_HEAD" ;;
+            merge_group) range="$MQ_BASE...$MQ_HEAD" ;;
+            push)
+              case "$REF" in
+                refs/heads/*)
+                  if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ] &&
+                    git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+                    range="$PUSH_BEFORE...$PUSH_AFTER"
+                  fi ;;
+              esac ;;
+          esac
+          if [ -n "$range" ]; then
+            git diff --name-only "$range" | tee changed.txt
+            code="$(bash ../rust-fs-core/scripts/code-changed.sh < changed.txt)"
+          else
+            code=true
+          fi
+          echo "code=$code ($EVENT${range:+ $range})"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  unit-gate:
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  unit:
+    name: unit (no tools, no fixtures)
+    needs: [changes, unit-gate]
+    runs-on: ${{ needs.unit-gate.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
+      - name: Install chore
+        # Pinned (CHORE_VERSION) and checked against the release's
+        # checksums: the siblings, the tools and the tests all come
+        # through it.
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core (for its scripts) and fs-linux-test-harness, at
+        # the refs pinned in chores.yml.
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install qemu (for test-disk generator)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 libarchive-tools
-      - name: Cache cargo registry
+      # restore-keys: any Cargo.lock change (fuzz/Cargo.lock included) misses
+      # the exact key, and a cold start prints every crate download and
+      # compile into the tier log -- 714 lines against the unit budget of
+      # 700, measured on #370, where a warm run prints about 645.
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Cache alpine VM assets
-        uses: actions/cache@v4
+          key: ${{ runner.os }}-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-unit-cargo-
+      - name: No fixtures are present
+        # A self-hosted runner (the runner gate hands unit one) is not a fresh
+        # machine: its workspace and caches outlive the job before this one.
+        # Measured on merge-group run 44795173191, where checkout had emptied
+        # the workspace and test-disks/ still held images by this step, on
+        # antimatter-vps-linux-x64-runner-fflsv. Images are gitignored
+        # (test-disks/*.img) and are never part of this job's inputs, so any
+        # found here came from the runner, not from the commit. Report what is
+        # there (so the next occurrence names its source), remove it, and let
+        # the check below stay the proof that nothing is left. A symlinked or
+        # mounted test-disks/ is shared with something else: never delete
+        # through it, fail as before.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          stale=(test-disks/*.img)
+          shared=false
+          if [ -L test-disks ]; then shared=true; fi
+          if command -v mountpoint >/dev/null && mountpoint -q test-disks; then shared=true; fi
+          if [ "${#stale[@]}" -gt 0 ] && ! $shared; then
+            echo "::warning::test-disks/ held ${#stale[@]} image(s) this job did not make; removing them"
+            ls -l -- "${stale[@]}" || true
+            rm -f -- "${stale[@]}"
+          fi
+          left=(test-disks/*.img)
+          if [ "${#left[@]}" -gt 0 ]; then
+            echo "::error::test-disks/ has images; this job must prove the unit tier needs none"
+            exit 1
+          fi
+      - name: chore test:unit
+        id: tier
+        run: chore test:unit
+      - name: chore lint
+        # Runs for every pull request, alongside test and test-arm64.
+        run: chore lint
+      - name: A signal to scripts/test.sh alone stops the run
+        # Here because the shell tier runs only in the full profile, after every
+        # test tier, and some of its guards need fixtures. This one needs neither,
+        # and every tier starts its tests through the wrapper it holds.
+        run: bash tests/scripts/test-term-stops-run.sh
+      - name: A signal to scripts/guest-scratch.sh alone stops its command
+        # Here because the shell tier runs only in the full profile, after every
+        # test tier. This guard needs no fixture and no VM, and the script it
+        # holds is what runs the suite in the guest.
+        run: bash tests/scripts/test-guest-scratch-term.sh
+      - name: chore staticlib copies the archive from where cargo built it
+        # Here for the same reason: it needs no fixture and no sibling, and it
+        # builds a stand-in crate in seconds.
+        run: bash tests/scripts/test-staticlib-target-dir.sh
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed; not before the tier
+        # ran, though, or there is no log and this step's red hides the real
+        # one (#306).
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
         with:
-          path: test-disks/.vm-cache
-          key: vm-cache-alpine-3.21.4
-      - name: Generate test disks
-        run: bash test-disks/build-ext4-feature-images.sh
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --release
+          name: tier-logs-unit
+          path: tmp/logs/*.log
+          if-no-files-found: error
 
-  # Validate the mkfs_ext4 CLI binary's output by running the kernel's own
-  # fsck.ext4 (from e2fsprogs) against an image we generated. This is the
-  # canonical "does Linux think this is a valid ext4 volume?" check — much
-  # stricter than our own crate's read-path round-trip because it exercises
-  # every assertion in e2fsck's superblock + group-descriptor + inode-table
-  # validation, including the metadata-csum verification.
-  #
-  # Runs on every PR + push so a regression in the mkfs path is caught
-  # before the binary ships to a tag. There's no Windows equivalent for
-  # ext4 because Windows chkdsk doesn't speak ext4.
-  validate-mkfs-bin:
-    name: validate mkfs_ext4 (fsck.ext4 strict)
-    runs-on: ubuntu-latest
+  fixtures-gate:
+    needs: changes
+    if: needs.changes.outputs.profile == 'full' && needs.changes.outputs.code == 'true'
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
+  fixtures:
+    name: fixtures (harness VM, x86_64 KVM)
+    needs: [changes, fixtures-gate]
+    if: needs.changes.outputs.profile == 'full' && needs.changes.outputs.code == 'true'
+    runs-on: ${{ needs.fixtures-gate.outputs.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # The crate has a path dep on am-fs-core (../rust-fs-core).
-      # Clone the sibling repo alongside so cargo can resolve it.
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.2 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Upstream virtiofsd 1.14.0
+        # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
+        # non-UTF-8 xattr name (fs-linux-test-harness #274). The tag must
+        # match LINUX_HARNESS_REF in chores.yml.
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.11.0
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore fixtures
+        run: chore fixtures
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks/*.img
+          if-no-files-found: error
+          retention-days: 7
+
+  test-gate:
+    needs: fixtures
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
+  test:
+    name: test (x86_64, oracles in the VM)
+    needs: [fixtures, test-gate]
+    runs-on: ${{ needs.test-gate.outputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Install e2fsprogs
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq e2fsprogs
-      - name: Cache cargo registry
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-mkfs-${{ hashFiles('**/Cargo.lock') }}
-      - name: Build mkfs_ext4
-        run: cargo build --locked --release --bin mkfs_ext4
-      # 32 MiB is the v1 single-block-group cap. Keep it as the smoke
-      # test target and add a larger one once multi-group lands.
-      - name: Format 32 MiB image and validate with fsck.ext4
+          key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-x86_64-cargo-
+      - name: Upstream virtiofsd 1.14.0
+        # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
+        # non-UTF-8 xattr name (fs-linux-test-harness #274). The tag must
+        # match LINUX_HARNESS_REF in chores.yml.
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.11.0
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore tools
+        run: chore tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # THE EVIDENCE, NOT THE CLAIM. e2fsprogs cannot be removed from an
+      # Ubuntu runner — it is essential — so instead every one of its
+      # programs is replaced with a stub that fails loudly. Nothing this
+      # job runs may use them: the tools belong to the guest, and a test
+      # that reached for one here would turn the run red with a message
+      # saying so, rather than quietly passing on the wrong version.
+      - name: Make the runner's own e2fsprogs unusable
         run: |
-          truncate -s 32M /tmp/out.img
-          ./target/release/mkfs_ext4 -L CITEST -U deadbeef-cafe-1234-5678-0123456789ab /tmp/out.img
-          # -f forces a check even if FS thinks it's clean; -n declines
-          # any repair offer (so this is read-only and exits non-zero
-          # if anything is wrong rather than silently auto-fixing).
-          fsck.ext4 -fnv /tmp/out.img
-      - name: Verify volume label and UUID round-tripped
+          set -eu
+          for tool in debugfs dumpe2fs e2fsck fsck.ext4 mke2fs mkfs.ext4 tune2fs resize2fs; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+            printf '#!/bin/sh\necho "::error::%s ran on the runner; the oracle tools belong in the VM" >&2\nexit 97\n' \
+              "$tool" | sudo tee "$path" >/dev/null
+            sudo chmod +x "$path"
+            echo "poisoned $path"
+          done
+      - name: chore lint
+        run: chore lint
+      - name: chore test
+        id: tier
+        run: chore test
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed; not before the tier
+        # ran, though, or there is no log and this step's red hides the real
+        # one (#306).
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-x86_64
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  test-arm64-gate:
+    needs: fixtures
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-arm64
+
+  test-arm64:
+    name: test (aarch64, no KVM on this runner)
+    needs: [fixtures, test-arm64-gate]
+    runs-on: ${{ needs.test-arm64-gate.outputs.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
         run: |
-          # tune2fs prints the on-disk superblock metadata; grep confirms
-          # the CLI args propagated to the bytes fsck just validated.
-          tune2fs -l /tmp/out.img > /tmp/sb.txt
-          cat /tmp/sb.txt
-          grep -q "Filesystem volume name:.*CITEST" /tmp/sb.txt
-          grep -qi "Filesystem UUID:.*deadbeef-cafe-1234-5678-0123456789ab" /tmp/sb.txt
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-aarch64-cargo-
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      - name: chore lint
+        run: chore lint
+      - name: chore test:unit
+        id: tier
+        run: chore test:unit
+      # Everything that reads a fixture but needs no VM. The oracle and
+      # kernel tiers cannot run here — GitHub's arm64 runners have no
+      # /dev/kvm — and they are not architecture-specific: they read the
+      # same bytes the x86_64 job's guest reads.
+      - name: chore test:images
+        run: chore test:images
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed; not before the tier
+        # ran, though, or there is no log and this step's red hides the real
+        # one (#306).
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-aarch64
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  suite-in-vm-gate:
+    needs: fixtures
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
+  suite-in-vm:
+    name: suite in the guest (the macOS path)
+    needs: [fixtures, suite-in-vm-gate]
+    runs-on: ${{ needs.suite-in-vm-gate.outputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Upstream virtiofsd 1.14.0
+        # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
+        # non-UTF-8 xattr name (fs-linux-test-harness #274). The tag must
+        # match LINUX_HARNESS_REF in chores.yml.
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.11.0
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # No Rust on the runner: the toolchain that matters is the one the
+      # guest installs from rust-toolchain.toml. That is the point of the
+      # job — on a Mac there is no usable host toolchain for these tests
+      # either.
+      - name: chore test:vm
+        id: tier
+        run: chore test:vm
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed; not before the tier
+        # ran, though, or there is no log and this step's red hides the real
+        # one (#306).
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-suite-in-vm
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  wasm-gate:
+    needs: changes
+    if: needs.changes.outputs.profile == 'full'
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  wasm:
+    name: wasm32 (browser build, tests under Node)
+    needs: [changes, wasm-gate]
+    if: needs.changes.outputs.profile == 'full'
+    runs-on: ${{ needs.wasm-gate.outputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-wasm-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-wasm-cargo-
+      - name: chore tools:wasm
+        # The wasm32 target, and wasm-bindgen-test-runner at the exact
+        # wasm-bindgen version Cargo.lock resolved.
+        run: chore tools:wasm
+      - name: chore test:wasm
+        id: tier
+        run: chore test:wasm
+      - name: Keep the tier logs
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-wasm
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  semver-gate:
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  semver:
+    # `chore check:semver`: this tree's public API against the newest
+    # version on crates.io, refusing a break the version in Cargo.toml does
+    # not declare (#120). No fixtures, no VM -- only the registry.
+    name: semver (public API against crates.io)
+    needs: [changes, semver-gate]
+    runs-on: ${{ needs.semver-gate.outputs.runner }}
+    timeout-minutes: 30
+    env:
+      # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
+      # checksum-verified by the action, rather than a ten-minute build.
+      CARGO_SEMVER_CHECKS_VERSION: "0.50.0"
+      # A failing tier prints only its verdict by default. Here the tail IS
+      # the answer -- which items broke -- so it is printed in full.
+      OUTPUT_BUDGET_FAIL_TAIL: "200"
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@${{ env.CARGO_SEMVER_CHECKS_VERSION }}
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-semver-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-semver-cargo-
+      - name: chore check:semver
+        id: tier
+        run: chore check:semver
+      - name: Keep the tier logs
+        # Not before the tier ran: there is no log then, and this step's red
+        # would hide the real one (#306).
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-semver
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  msrv-gate:
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  msrv:
+    name: msrv (Cargo.toml rust-version)
+    needs: [changes, msrv-gate]
+    runs-on: ${{ needs.msrv-gate.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/msrv
+          key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-msrv-cargo-
+      - name: chore check:msrv
+        # The script installs the toolchain rust-version names; the runner's
+        # rustup is all it needs.
+        run: chore check:msrv
+
+  cli-gate:
+    needs: changes
+    if: needs.changes.outputs.profile == 'full'
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  cli:
+    name: cli (the installed tools, on PATH)
+    needs: [changes, cli-gate]
+    if: needs.changes.outputs.profile == 'full'
+    runs-on: ${{ needs.cli-gate.outputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cli-cargo-
+      - name: chore cli:install
+        run: chore cli:install
+      # FIRST on PATH, ahead of the runner's own /usr/sbin/mkfs.ext4 and
+      # fsck.ext4 -- which doctor then reports as present and not run.
+      - name: The staged tools first on PATH
+        run: scripts/cli-install.sh --print-bin-dir >> "$GITHUB_PATH"
+      - name: chore test:cli
+        id: tier
+        run: chore test:cli
+      # THE RELEASE TARBALL, built here so a release is not the first time
+      # it is put together: rust-fs-core's package-cli, run in place from
+      # ../rust-fs-core as release.yml's called workflow runs it, stages the
+      # install prefix Cargo.toml's [package.metadata.package-cli] declares
+      # from the binary cli:install built, then refuses it unless it holds
+      # exactly that layout, every dotted name is a relative symlink to
+      # bin/rust-fs-ext4, every name has its man page and completions,
+      # CAVEATS is at most four lines, and every name answers --version as
+      # this crate at Cargo.toml's version.
+      - name: The release tarball has the install layout
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p tmp/package
+          cd tmp/package
+          tarball="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" linux-x86_64 "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release" | tail -n 1)"
+          tar -tzvf "$tarball"
+      - name: Keep the tier logs
+        # Not before the tier ran: there is no log then, and this step's red
+        # would hide the real one (#306).
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-cli
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  provenance-gate:
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  provenance:
+    name: provenance (no kernel or e2fsprogs internals named)
+    needs: [changes, provenance-gate]
+    runs-on: ${{ needs.provenance-gate.outputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        # Only a self-hosted Linux runner lacks it; the hosted image has it.
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          fi
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore check:provenance
+        run: chore check:provenance
+
+  ci-ok-gate:
+    if: always()
+    needs: [changes-gate, changes, unit-gate, unit, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, wasm-gate, wasm, semver-gate, semver, msrv-gate, msrv, cli-gate, cli, provenance-gate, provenance]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [changes-gate, changes, unit-gate, unit, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, wasm-gate, wasm, semver-gate, semver, msrv-gate, msrv, cli-gate, cli, provenance-gate, provenance, ci-ok-gate]
+    runs-on: ${{ needs.ci-ok-gate.outputs.runner || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every job ran and succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          # The plan is full for every event; false means documentation-only.
+          # scripts/ci-ok.sh accepts only fixture/VM skips in that case.
+          PROFILE: ${{ needs.changes.outputs.profile }}
+          CODE: ${{ needs.changes.outputs.code }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key) \(.value.result)"' | bash scripts/ci-ok.sh

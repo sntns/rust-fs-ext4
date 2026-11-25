@@ -15,13 +15,23 @@
 //!
 //! ```text
 //!   1. Write transaction blocks (descriptor + data + commit) to journal
-//!      logical blocks [1, 1+N) → flush.
+//!      logical blocks [1, 1+N), set `needs_recovery` in the ext4
+//!      superblock → flush.
 //!   2. Set jsb.start = 1 (mark journal dirty), keep jsb.sequence as-is →
 //!      flush.
 //!   3. Write each fs block in the transaction to its final on-disk
 //!      location → flush.
-//!   4. Set jsb.start = 0 (clean), bump jsb.sequence → flush.
+//!   4. Set jsb.start = 0 (clean), bump jsb.sequence, clear
+//!      `needs_recovery` → flush.
 //! ```
+//!
+//! `needs_recovery` (`INCOMPAT_RECOVER`) is what Linux replays on: a
+//! filesystem without it has its journal wiped at mount, whatever `s_start`
+//! says (#228). So it reaches the disk before the journal is marked dirty,
+//! and a transaction that journals the superblock block carries it set,
+//! or step 3 would clear it while the journal is still live. Clearing it
+//! in the same flush as the clean journal superblock is safe either way
+//! round: by then step 3 is on disk, so a wiped journal loses nothing.
 //!
 //! Crash analysis:
 //!
@@ -62,6 +72,11 @@ use crate::transaction::Transaction;
 /// Cheap to construct (one inode read + extent walk). Not thread-safe; the
 /// outer Filesystem lock must serialize mutating ops anyway.
 pub struct JournalWriter {
+    healthy: bool,
+    /// Leave `needs_recovery` set after a checkpoint rather than clearing
+    /// it: a checked mount (`Filesystem::mount_recovering`) clears it only
+    /// at `finish`, so the volume reads as in recovery while it is owned.
+    hold_needs_recovery: bool,
     /// `physical_map[logical]` is the fs physical block backing journal
     /// logical block `logical`. Length = `jsb.max_len`. Block 0 is the
     /// JBD2 superblock; blocks 1.. carry transactions.
@@ -71,6 +86,30 @@ pub struct JournalWriter {
     /// Cached JBD2 superblock — mutated in memory + flushed to disk on
     /// every commit. The on-disk truth always matches this between calls.
     jsb: JournalSuperblock,
+    /// How many blocks the filesystem has, so a write can be checked
+    /// against it after the mount has gone out of scope.
+    blocks_count: u64,
+}
+
+/// Whether a journal of `max_len` blocks fits both its inode and the device.
+fn journal_len_fits(
+    max_len: u32,
+    inode_size: u64,
+    block_size: u32,
+    device_bytes: u64,
+) -> Result<()> {
+    let block_size = u64::from(block_size.max(1));
+    if u64::from(max_len) > inode_size / block_size {
+        return Err(Error::Corrupt(
+            "journal declares more blocks than its inode holds",
+        ));
+    }
+    if u64::from(max_len) > device_bytes / block_size {
+        return Err(Error::Corrupt(
+            "journal declares more blocks than the device holds",
+        ));
+    }
+    Ok(())
 }
 
 impl JournalWriter {
@@ -95,6 +134,40 @@ impl JournalWriter {
         // at 4 KiB blocks that's 8192 entries — tiny. Allocates once at
         // mount; every commit then does a constant-time index.
         let bs = fs.sb.block_size();
+        // A JOURNAL IS INSIDE THE FILESYSTEM IT JOURNALS.
+        //
+        // `s_maxlen` is a raw `u32` and nothing bounds it: 0xFFFFFFFF
+        // reserved 34 GB here before a block was mapped, which
+        // `handle_alloc_error` answers by aborting -- past
+        // `ffi_guard`'s `catch_unwind`, killing the host extension.
+        // The journal's blocks are filesystem blocks, so there cannot
+        // be more of them than the filesystem has.
+        if u64::from(jsb.max_len) > fs.sb.blocks_count {
+            return Err(Error::Corrupt(
+                "journal declares more blocks than the filesystem holds",
+            ));
+        }
+        // `s_blocks_count` is a raw field too, so the bound above is only as
+        // good as the image (#182). Two that are not the superblock's to
+        // choose: the journal inode's own length, which is the check the
+        // kernel makes ("journal file too short"), and the device, which a
+        // journal on it cannot outgrow. `i_size` is raw as well; the device
+        // bound is the one that caps the reservation below.
+        journal_len_fits(jsb.max_len, jinode.size, bs, fs.dev.size_bytes())?;
+
+        // NOR OVER THE BLOCKS EVERY MOUNT READS FIRST (#183). A commit
+        // writes wherever this map says, and `journal_apply::byte_offset_in`
+        // refuses only a block past the filesystem or the device -- block 0
+        // passes, and a journal inode mapping a logical block there put the
+        // first commit's descriptor over the primary superblock. So a
+        // mapping onto block 0, the superblock, group 0's descriptor table
+        // or its reserved growth, or past the end, is refused here, once,
+        // rather than trusted at every write.
+        let descriptor_bytes = fs.sb.block_group_count() * u64::from(fs.sb.desc_size);
+        let group0_metadata_end = u64::from(fs.sb.first_data_block)
+            + 1
+            + descriptor_bytes.div_ceil(u64::from(bs))
+            + u64::from(fs.sb.reserved_gdt_blocks);
         let mut physical_map = Vec::with_capacity(jsb.max_len as usize);
         for logical in 0..jsb.max_len as u64 {
             let phys = crate::indirect::map_logical_any(
@@ -107,10 +180,19 @@ impl JournalWriter {
             .ok_or(Error::Corrupt(
                 "journal_writer: journal inode has unmapped logical block",
             ))?;
+            if phys < group0_metadata_end || phys >= fs.sb.blocks_count {
+                return Err(Error::Corrupt(
+                    "journal_writer: journal inode maps a block onto the superblock, group 0's \
+                     descriptor table, or past the end of the filesystem",
+                ));
+            }
             physical_map.push(phys);
         }
 
         Ok(Some(Self {
+            healthy: true,
+            hold_needs_recovery: false,
+            blocks_count: fs.sb.blocks_count,
             physical_map,
             block_size: bs,
             jsb,
@@ -124,7 +206,18 @@ impl JournalWriter {
             self.jsb.sequence,
             self.block_size,
             self.jsb.uses_64bit(),
-            self.jsb.uses_csum_v2_or_v3(),
+            // CSUM_V3 ALONE. `Transaction::begin`'s last parameter is
+            // "does this journal use v3 tags", and it was handed "does
+            // this journal use checksums at all" -- so on a CSUM_V2
+            // journal the encoder laid 16-byte v3 tags while both this
+            // crate's reader (`journal.rs`, keyed on CSUM_V3) and the
+            // kernel parse classical ones. Tag 0 aliases
+            // correctly, which hid it on single-block transactions;
+            // from tag 1 on, the reader takes the writer's zeroed
+            // checksum slot as `t_blocknr` -- fs block 0 -- so a
+            // recovery replays a data block onto the ext4 superblock.
+            // Every mkdir, create and unlink is multi-block.
+            self.jsb.uses_csum_v3(),
         )
     }
 
@@ -144,6 +237,28 @@ impl JournalWriter {
     /// the on-disk JSB has been written back twice (dirty marker + clean
     /// marker).
     pub fn commit(&mut self, dev: &dyn BlockDevice, tx: &Transaction) -> Result<()> {
+        if !self.healthy {
+            return Err(Error::Corrupt("journal writer failed; reopen for recovery"));
+        }
+        self.commit_inner(dev, tx)
+    }
+
+    /// This writer, keeping `needs_recovery` set after every checkpoint.
+    pub(crate) fn holding_needs_recovery(mut self) -> Self {
+        self.hold_needs_recovery = true;
+        self
+    }
+
+    /// False once a commit failed after its first device write: the log and
+    /// the final locations are then in a state only a fresh replay can judge,
+    /// so this writer refuses every later commit. A refusal before any write
+    /// (read-only device, stale sequence, oversized transaction) leaves the
+    /// device untouched and the writer usable.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+
+    fn commit_inner(&mut self, dev: &dyn BlockDevice, tx: &Transaction) -> Result<()> {
         if !dev.is_writable() {
             return Err(Error::ReadOnly);
         }
@@ -158,7 +273,47 @@ impl JournalWriter {
             ));
         }
 
-        let blocks = tx.commit()?;
+        // EVERY WRITE IS ONE BLOCK OF THIS VOLUME (#327). `writes` and
+        // `block_size` are public, so `add_write`'s length check can be
+        // bypassed: a 2x-block entry overwrote the block after its target,
+        // and a short superblock entry panicked below. Checked before any
+        // I/O, so a refusal leaves the device untouched.
+        if tx.block_size != self.block_size {
+            return Err(Error::InvalidArgument(
+                "journal_writer: transaction block size does not match the volume",
+            ));
+        }
+        if tx
+            .writes
+            .iter()
+            .any(|w| w.bytes.len() != self.block_size as usize)
+        {
+            return Err(Error::InvalidArgument(
+                "journal_writer: a journaled write is not exactly one block",
+            ));
+        }
+
+        // The superblock block, if journaled, keeps `needs_recovery` set
+        // until step 4 clears it (#228) -- in every write to it, since a
+        // transaction may carry more than one and step 3 applies them all
+        // in order.
+        let sb_block = self.sb_block();
+        let patched;
+        let tx = if tx.writes.iter().any(|w| w.fs_block == sb_block) {
+            let mut copy = tx.clone();
+            let off = self.sb_offset_in_block();
+            for w in copy.writes.iter_mut().filter(|w| w.fs_block == sb_block) {
+                crate::journal_apply::set_needs_recovery_in(&mut w.bytes[off..off + 1024], true);
+            }
+            patched = copy;
+            &patched
+        } else {
+            tx
+        };
+
+        // With every checksum the journal declares: a zero there is a
+        // transaction Linux's recovery stops at (#80).
+        let blocks = tx.commit_for(&self.jsb)?;
         if blocks.is_empty() {
             return Ok(()); // empty transaction is a no-op
         }
@@ -168,7 +323,9 @@ impl JournalWriter {
             ));
         }
 
-        let bs_u64 = self.block_size as u64;
+        // From the first write on, a failure leaves the device in a state
+        // only a fresh replay can judge; cleared again once step 4 is done.
+        self.healthy = false;
 
         // -- Step 1: write transaction blocks to journal at logical [1..1+N).
         //    Block 0 is the JBD2 superblock; we never overwrite it here.
@@ -176,8 +333,21 @@ impl JournalWriter {
         for (i, block) in blocks.iter().enumerate() {
             let jblock_idx = txn_first_jblock + i;
             let phys = self.physical_map[jblock_idx];
-            dev.write_at(phys * bs_u64, block)?;
+            // The journal inode's extent tree says where its blocks
+            // are, and it is metadata off the disk like any other. The
+            // replay side checks this (`journal_apply::byte_offset_of`);
+            // the writer did not, so a journal inode mapping logical
+            // block 1 to fs block 0 put the first journalled operation's
+            // descriptor over the ext4 superblock.
+            let at = crate::journal_apply::byte_offset_in(
+                phys,
+                self.blocks_count,
+                self.block_size,
+                dev.size_bytes(),
+            )?;
+            dev.write_at(at, block)?;
         }
+        crate::journal_apply::write_needs_recovery(dev, true)?;
         dev.flush()?;
 
         // -- Step 2: mark journal dirty. start = first txn block; sequence
@@ -188,7 +358,13 @@ impl JournalWriter {
 
         // -- Step 3: apply writes to final-location fs blocks.
         for w in &tx.writes {
-            dev.write_at(w.fs_block * bs_u64, &w.bytes)?;
+            let at = crate::journal_apply::byte_offset_in(
+                w.fs_block,
+                self.blocks_count,
+                self.block_size,
+                dev.size_bytes(),
+            )?;
+            dev.write_at(at, &w.bytes)?;
         }
         dev.flush()?;
 
@@ -196,9 +372,22 @@ impl JournalWriter {
         self.jsb.start = 0;
         self.jsb.sequence = self.jsb.sequence.wrapping_add(1);
         self.write_jsb(dev)?;
+        if !self.hold_needs_recovery {
+            crate::journal_apply::write_needs_recovery(dev, false)?;
+        }
         dev.flush()?;
 
+        self.healthy = true;
         Ok(())
+    }
+
+    /// The fs block holding the primary superblock: 0, or 1 at 1 KiB.
+    fn sb_block(&self) -> u64 {
+        crate::superblock::SUPERBLOCK_OFFSET / u64::from(self.block_size)
+    }
+
+    fn sb_offset_in_block(&self) -> usize {
+        (crate::superblock::SUPERBLOCK_OFFSET % u64::from(self.block_size)) as usize
     }
 
     /// Re-emit the JBD2 superblock at journal logical block 0 from the
@@ -257,63 +446,370 @@ impl JournalWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_io::FileDevice;
-    use std::fs;
-    use std::sync::Arc;
 
-    fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let src = format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name);
-        if !std::path::Path::new(&src).exists() {
-            return None;
+    #[test]
+    fn a_journal_must_fit_its_inode_and_the_device() {
+        // 8 blocks in the inode, 16 on the device.
+        assert!(journal_len_fits(8, 8 * 4096, 4096, 16 * 4096).is_ok());
+        assert!(journal_len_fits(9, 8 * 4096, 4096, 16 * 4096).is_err());
+        // An inode claiming more than the device holds does not raise the
+        // device's ceiling.
+        assert!(journal_len_fits(17, u64::MAX, 4096, 16 * 4096).is_err());
+        assert!(journal_len_fits(16, u64::MAX, 4096, 16 * 4096).is_ok());
+        assert!(journal_len_fits(u32::MAX, u64::MAX, 4096, 64 << 20).is_err());
+    }
+
+    /// Whether a volume has a journal decides what `open` returns, and
+    /// the answer is checked in both directions on volumes this crate
+    /// formats itself (#265).
+    ///
+    /// The test this replaces copied `ext4-no-csum.img`, called `open`,
+    /// and threw the answer away — `Some` and `None` both passed, and
+    /// the comment above it said the image "is built without a journal
+    /// *in some configs*", which nothing checked either. So the one
+    /// behaviour its name claimed was untested: a `JournalWriter` handed
+    /// back for a volume with no journal would have kept it green while
+    /// every write through it went to blocks that are not a journal.
+    ///
+    /// Formatting here rather than reading a fixture is what makes the
+    /// case certain, and it runs everywhere — no fixtures, no VM, no
+    /// tools.
+    mod journal_presence {
+        use super::*;
+        use crate::features::{Compat, FsFlavor};
+        use std::sync::{Arc, Mutex};
+
+        const BS: u32 = 1024;
+        /// Room for the 1024-block journal an ext3 format lays down,
+        /// plus its metadata.
+        const VOL: u64 = 8 * 1024 * 1024;
+
+        struct MemDev {
+            bytes: Mutex<Vec<u8>>,
         }
-        let dst = format!("/tmp/fs_ext4_jw_{}_{tag}_{n}.img", std::process::id());
-        fs::copy(&src, &dst).ok()?;
-        Some(dst)
+
+        impl MemDev {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    bytes: Mutex::new(vec![0u8; VOL as usize]),
+                })
+            }
+        }
+
+        impl crate::block_io::BlockDevice for MemDev {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+                let b = self.bytes.lock().unwrap();
+                let (start, end) = (offset as usize, offset as usize + buf.len());
+                if end > b.len() {
+                    return Err(Error::Corrupt("MemDev: read past end"));
+                }
+                buf.copy_from_slice(&b[start..end]);
+                Ok(())
+            }
+            fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+                let mut b = self.bytes.lock().unwrap();
+                let (start, end) = (offset as usize, offset as usize + buf.len());
+                if end > b.len() {
+                    return Err(Error::Corrupt("MemDev: write past end"));
+                }
+                b[start..end].copy_from_slice(buf);
+                Ok(())
+            }
+            fn size_bytes(&self) -> u64 {
+                VOL
+            }
+            fn flush(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_writable(&self) -> bool {
+                true
+            }
+        }
+
+        fn formatted(flavor: FsFlavor) -> Filesystem {
+            let dev = MemDev::new();
+            crate::mkfs::format_filesystem_with_flavor(dev.as_ref(), None, None, VOL, BS, flavor)
+                .expect("format");
+            Filesystem::mount(dev).expect("mount")
+        }
+
+        /// A volume with no journal has no journal writer.
+        #[test]
+        fn open_returns_none_when_the_volume_has_no_journal() {
+            let fs = formatted(FsFlavor::Ext4);
+            // THE FIXTURE'S OWN SHAPE FIRST. A test that asserts `None`
+            // against a volume that turned out to have a journal is
+            // asserting nothing about the case it names.
+            assert_eq!(
+                fs.sb.feature_compat & Compat::HAS_JOURNAL.bits(),
+                0,
+                "this volume was formatted without a journal and says it has one"
+            );
+            assert_eq!(fs.sb.journal_inode, 0, "and names no journal inode");
+
+            let writer = JournalWriter::open(&fs).expect("open");
+            assert!(
+                writer.is_none(),
+                "a volume with no journal handed back a journal writer, so every write \
+                 through it would go to blocks that are not a journal"
+            );
+        }
+
+        /// And one with a journal has one — or the test above would pass
+        /// on an `open` that never returns anything.
+        #[test]
+        fn open_returns_a_writer_when_the_volume_has_one() {
+            let fs = formatted(FsFlavor::Ext3);
+            assert_ne!(
+                fs.sb.feature_compat & Compat::HAS_JOURNAL.bits(),
+                0,
+                "this volume was formatted with a journal and says it has none"
+            );
+            assert_ne!(fs.sb.journal_inode, 0, "and it names the journal inode");
+
+            let writer = JournalWriter::open(&fs).expect("open");
+            assert!(
+                writer.is_some(),
+                "a volume with a journal handed back nothing, so a caller would fall \
+                 back to unjournaled writes on a filesystem that has a log"
+            );
+        }
+
+        /// A transaction refused before any journal block is written leaves
+        /// nothing on the device to recover from, so it must not retire the
+        /// writer: only a commit whose I/O began and failed does.
+        #[test]
+        fn a_refusal_before_any_write_leaves_the_writer_usable() {
+            let fs = formatted(FsFlavor::Ext3);
+            let mut writer = JournalWriter::open(&fs).expect("open").expect("writer");
+            let block = fs.sb.blocks_count - 1;
+            let mut too_large = writer.begin();
+            for i in 0..=writer.max_blocks_per_transaction() as u64 {
+                too_large
+                    .add_write(block - i, vec![0u8; BS as usize])
+                    .expect("add_write");
+            }
+            assert!(writer.commit(fs.dev.as_ref(), &too_large).is_err());
+            assert!(
+                writer.is_healthy(),
+                "a transaction refused before it wrote anything retired the writer"
+            );
+            let mut small = writer.begin();
+            small
+                .add_write(block, vec![0u8; BS as usize])
+                .expect("add_write");
+            writer
+                .commit(fs.dev.as_ref(), &small)
+                .expect("the next transaction commits");
+        }
+
+        /// A journal writer on a freshly formatted ext3 volume, with the
+        /// device kept so its bytes can be compared.
+        fn writer_on_ext3() -> (Arc<MemDev>, Filesystem, JournalWriter) {
+            let dev = MemDev::new();
+            crate::mkfs::format_filesystem_with_flavor(
+                dev.as_ref(),
+                None,
+                None,
+                VOL,
+                BS,
+                FsFlavor::Ext3,
+            )
+            .expect("format");
+            let fs = Filesystem::mount(dev.clone()).expect("mount");
+            let writer = JournalWriter::open(&fs).expect("open").expect("writer");
+            (dev, fs, writer)
+        }
+
+        /// Commits `tx` and asserts it is refused with the device untouched
+        /// and the writer still usable.
+        fn assert_refused_untouched(tx: &Transaction, what: &str) {
+            let (dev, fs, mut writer) = writer_on_ext3();
+            let mut tx = tx.clone();
+            tx.sequence = writer.begin().sequence;
+            let before = dev.bytes.lock().unwrap().clone();
+            let got = writer.commit(fs.dev.as_ref(), &tx);
+            assert!(got.is_err(), "{what}: committed ({got:?})");
+            assert!(
+                *dev.bytes.lock().unwrap() == before,
+                "{what}: the refused commit wrote to the device"
+            );
+            assert!(
+                writer.is_healthy(),
+                "{what}: the refusal retired the writer"
+            );
+        }
+
+        /// `writes` is public, so an entry can bypass `add_write`'s length
+        /// check; a 2x-block entry overwrote the block after its target
+        /// (#327).
+        #[test]
+        fn a_write_longer_than_a_block_is_refused_before_any_write() {
+            let mut tx = Transaction::begin(0, BS, false, false);
+            tx.writes.push(crate::transaction::JournaledBlock {
+                fs_block: 100,
+                bytes: vec![0xA5; 2 * BS as usize],
+            });
+            assert_refused_untouched(&tx, "a 2x-block entry");
+        }
+
+        /// A superblock entry shorter than a block panicked slicing
+        /// `bytes[off..off + 1024]` (#327).
+        #[test]
+        fn a_short_superblock_write_is_refused_not_a_panic() {
+            let mut tx = Transaction::begin(0, BS, false, false);
+            tx.writes.push(crate::transaction::JournaledBlock {
+                fs_block: 1, // the superblock at 1 KiB
+                bytes: vec![0u8; 16],
+            });
+            assert_refused_untouched(&tx, "a 16-byte superblock entry");
+        }
+
+        /// A transaction begun for another block size is refused whole
+        /// (#327).
+        #[test]
+        fn a_transaction_for_another_block_size_is_refused() {
+            let mut tx = Transaction::begin(0, 2 * BS, false, false);
+            tx.add_write(100, vec![0xA5; 2 * BS as usize])
+                .expect("add_write at the transaction's own size");
+            assert_refused_untouched(&tx, "a 2 KiB transaction on a 1 KiB volume");
+        }
+
+        /// Drops every write after the first `budget`: a power cut.
+        struct CutDevice {
+            inner: Arc<MemDev>,
+            budget: Mutex<usize>,
+        }
+
+        impl crate::block_io::BlockDevice for CutDevice {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+                self.inner.read_at(offset, buf)
+            }
+            fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+                let mut left = self.budget.lock().unwrap();
+                if *left == 0 {
+                    return Ok(());
+                }
+                *left -= 1;
+                self.inner.write_at(offset, buf)
+            }
+            fn size_bytes(&self) -> u64 {
+                VOL
+            }
+            fn flush(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_writable(&self) -> bool {
+                true
+            }
+        }
+
+        /// A data block that begins with the journal magic goes into the log
+        /// escaped, and this crate's replay puts the magic back (#292).
+        ///
+        /// The commit is cut once the journal is marked dirty, so the target
+        /// holds only what replay gives it.
+        #[test]
+        fn a_block_starting_with_the_magic_is_logged_escaped_and_replayed_whole() {
+            let dev = MemDev::new();
+            crate::mkfs::format_filesystem_with_flavor(
+                dev.as_ref(),
+                None,
+                None,
+                VOL,
+                BS,
+                FsFlavor::Ext3,
+            )
+            .expect("format");
+            let fs = Filesystem::mount(dev.clone()).expect("mount");
+            let mut writer = JournalWriter::open(&fs).expect("open").expect("writer");
+            let target = fs.sb.blocks_count - 1;
+            let mut payload: Vec<u8> = (0..BS as usize).map(|j| 0x5A ^ (j % 251) as u8).collect();
+            payload[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
+
+            let mut tx = writer.begin();
+            tx.add_write(target, payload.clone()).expect("add_write");
+            // Descriptor, data, commit; `needs_recovery`; the dirty journal
+            // superblock. The final-location write is lost.
+            let cut = CutDevice {
+                inner: dev.clone(),
+                budget: Mutex::new(3 + 2),
+            };
+            writer.commit(&cut, &tx).expect("commit");
+            let logged_at = writer.physical_map[2];
+            drop(fs);
+
+            let read = |block: u64| {
+                let mut b = vec![0u8; BS as usize];
+                dev.read_at(block * BS as u64, &mut b).unwrap();
+                b
+            };
+            let logged = read(logged_at);
+            assert_eq!(
+                &logged[0..4],
+                &[0u8; 4],
+                "the logged copy starts with the journal magic, unescaped"
+            );
+            assert!(logged[4..] == payload[4..]);
+            assert_eq!(read(target), vec![0u8; BS as usize], "cut too late");
+
+            // A writable mount replays a dirty journal (`replay_if_dirty`).
+            let fs = Filesystem::mount(dev.clone()).expect("remount");
+            assert!(
+                crate::jbd2::read_superblock(&fs)
+                    .expect("journal superblock")
+                    .expect("a journal")
+                    .is_clean(),
+                "the remount did not replay the journal"
+            );
+            drop(fs);
+            assert!(
+                read(target) == payload,
+                "replay did not restore the block, magic and all"
+            );
+        }
     }
 
-    #[test]
-    fn open_returns_none_when_no_journal() {
-        // ext4-no-csum.img is built without a journal in some configs; if it
-        // happens to have one, this test is a no-op (we just exercise the
-        // open path). The point of the test is that open() itself doesn't
-        // panic on an unjournaled image.
-        let Some(path) = copy_to_tmp("ext4-no-csum.img", "no_journal") else {
-            return;
-        };
-        let dev = FileDevice::open(&path).expect("open ro");
-        let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-        // Just exercise — either Some or None is fine; we're checking
-        // structural correctness of the open path.
-        let _ = JournalWriter::open(&fs).expect("open journal_writer");
-        fs::remove_file(path).ok();
-    }
+    /// Tests that copy a fixture from `test-disks/` (`chore fixtures`).
+    mod needs_host {
+        use super::*;
+        use crate::block_io::FileDevice;
+        use std::fs;
+        use std::sync::Arc;
 
-    #[test]
-    fn empty_transaction_is_no_op() {
-        let Some(path) = copy_to_tmp("ext4-basic.img", "empty_tx") else {
-            return;
-        };
-        let dev = FileDevice::open_rw(&path).expect("open rw");
-        let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-        let Some(mut jw) = JournalWriter::open(&fs).expect("open writer") else {
-            return; // image has no journal — skip
-        };
-        let initial_seq = jw.jsb.sequence;
-        let tx = jw.begin();
-        // commit() short-circuits on tx.commit() returning a single commit
-        // block — actually tx.commit() always returns at least the commit
-        // block, so an empty tx still goes through the protocol but writes
-        // only one block. Verify it advances sequence by 1.
-        jw.commit(fs.dev.as_ref(), &tx).expect("commit");
-        assert_eq!(
-            jw.jsb.sequence,
-            initial_seq.wrapping_add(1),
-            "sequence should advance even for a no-write commit"
-        );
-        assert_eq!(jw.jsb.start, 0, "should be clean after commit");
-        fs::remove_file(path).ok();
+        fn copy_to_tmp(name: &str, tag: &str) -> String {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
+            let dst =
+                fs_ext4_test_support::temp_path!("fs_ext4_jw_{}_{tag}_{n}.img", std::process::id());
+            fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} to {dst}: {e}"));
+            dst
+        }
+
+        #[test]
+        fn empty_transaction_is_no_op() {
+            let path = copy_to_tmp("ext4-basic.img", "empty_tx");
+            let dev = FileDevice::open_rw(&path).expect("open rw");
+            let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
+            let mut jw = JournalWriter::open(&fs).expect("open writer").expect(
+                "ext4-basic.img is built with has_journal (test-disks/guest-build-images.sh)",
+            );
+            let initial_seq = jw.jsb.sequence;
+            let tx = jw.begin();
+            // commit() short-circuits on tx.commit() returning a single commit
+            // block — actually tx.commit() always returns at least the commit
+            // block, so an empty tx still goes through the protocol but writes
+            // only one block. Verify it advances sequence by 1.
+            jw.commit(fs.dev.as_ref(), &tx).expect("commit");
+            assert_eq!(
+                jw.jsb.sequence,
+                initial_seq.wrapping_add(1),
+                "sequence should advance even for a no-write commit"
+            );
+            assert_eq!(jw.jsb.start, 0, "should be clean after commit");
+            fs::remove_file(path).ok();
+        }
     }
 }

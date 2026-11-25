@@ -56,7 +56,7 @@ impl BlockDevice for MemDev {
 }
 
 #[test]
-fn mkfs_then_mount_yields_empty_root() {
+fn mkfs_then_mount_yields_a_root_holding_lost_found() {
     let size: u64 = 32 * 1024 * 1024; // 32 MiB
     let block_size: u32 = 4096;
     let dev = MemDev::new(size);
@@ -83,17 +83,20 @@ fn mkfs_then_mount_yields_empty_root() {
     assert!(fs.csum.enabled, "metadata_csum should be on");
     assert!(fs.sb.is_clean(), "fresh FS must be marked clean");
 
-    // Root inode (ino 2): mode 0o40755, type=dir, links=2.
+    // Root inode (ino 2): mode 0o40755, type=dir, links=3.
     let (root, _raw) = fs
         .read_inode_verified(2)
         .expect("root inode parses + verifies");
     assert!(root.is_dir(), "root must be a directory");
     assert_eq!(root.mode & S_IFDIR, S_IFDIR);
     assert_eq!(root.mode & 0o7777, 0o755, "root permission bits");
-    assert_eq!(root.links_count, 2, "root link count = 2 for `.`+`..`");
+    assert_eq!(
+        root.links_count, 3,
+        "root link count = 3 for `.`, `..` and lost+found's `..`"
+    );
     assert!(root.has_extents(), "root must use extents");
 
-    // Walk the root directory: expect exactly `.` and `..`.
+    // Walk the root directory: expect exactly `.`, `..` and `lost+found`.
     let bs = fs.sb.block_size();
     let phys = extent::map_logical(&root.block, dev_dyn.as_ref(), bs, 0)
         .expect("map_logical")
@@ -114,15 +117,18 @@ fn mkfs_then_mount_yields_empty_root() {
 
     let entries = dir::parse_block(&block, /* has_filetype */ true).expect("parse root dir");
     let names: Vec<Vec<u8>> = entries.iter().map(|e| e.name.clone()).collect();
-    assert!(names.iter().any(|n| n == b"."), "root dir missing `.`");
-    assert!(names.iter().any(|n| n == b".."), "root dir missing `..`");
     assert_eq!(
-        entries.len(),
-        2,
-        "expected only `.` and `..`, got {names:?}",
+        names,
+        [&b"."[..], b"..", b"lost+found"],
+        "expected only `.`, `..` and `lost+found`"
+    );
+    let inodes: Vec<u32> = entries.iter().map(|e| e.inode).collect();
+    assert_eq!(
+        inodes,
+        [2, 2, 11],
+        "`.` and `..` are the root; lost+found is 11"
     );
     for e in &entries {
-        assert_eq!(e.inode, 2, "both `.` and `..` point to root inode 2");
         assert_eq!(e.file_type, dir::DirEntryType::Directory);
     }
 }
@@ -172,7 +178,7 @@ fn mkfs_multi_group_reads_root() {
     assert!(root.is_dir(), "root must be a directory");
     assert_eq!(root.mode & S_IFDIR, S_IFDIR);
     assert_eq!(root.mode & 0o7777, 0o755, "invalid root permissions");
-    assert_eq!(root.links_count, 2, "invalid root link count (!= 2)");
+    assert_eq!(root.links_count, 3, "invalid root link count (!= 3)");
     assert!(root.has_extents(), "root must have extents");
 
     let bs = fs.sb.block_size();
@@ -195,7 +201,131 @@ fn mkfs_multi_group_reads_root() {
         "fs.csum does not verify"
     );
     let entries = dir::parse_block(&block, true).expect("parsing root directory block failed");
-    assert_eq!(entries.len(), 2, "expected only `.` and `..`");
+    assert_eq!(entries.len(), 3, "expected only `.`, `..` and `lost+found`");
     assert_eq!(entries[0].name, b".", "first entry must be `.`");
     assert_eq!(entries[1].name, b"..", "second entry must be `..`");
+    assert_eq!(
+        entries[2].name, b"lost+found",
+        "third entry must be `lost+found`"
+    );
+}
+
+/// The directory hash seed is written where the superblock keeps it, and
+/// the two fields in front of it are left zero (#225).
+///
+/// It was written eight bytes early, over `s_journal_dev` and
+/// `s_last_orphan`: every fresh volume had an orphan chain headed by
+/// inode 3,588,683,688, which the first mount then "recovered", rewriting
+/// the superblock of a volume nobody had touched. Checked for every
+/// flavour, by the raw bytes and by what a mount does with them.
+#[test]
+fn the_hash_seed_is_at_0xec_and_nothing_is_written_before_it() {
+    for flavor in [
+        fs_ext4::features::FsFlavor::Ext2,
+        fs_ext4::features::FsFlavor::Ext3,
+        fs_ext4::features::FsFlavor::Ext4,
+    ] {
+        let size: u64 = 64 * 1024 * 1024;
+        let dev = MemDev::new(size);
+        mkfs::format_filesystem_with_flavor(dev.as_ref(), Some("seed"), None, size, 4096, flavor)
+            .expect("format");
+        let sb = dev.bytes.lock().unwrap()[1024..2048].to_vec();
+        let field = |at: usize| u32::from_le_bytes(sb[at..at + 4].try_into().unwrap());
+        assert_eq!(field(0xE4), 0, "{flavor:?}: s_journal_dev");
+        assert_eq!(field(0xE8), 0, "{flavor:?}: s_last_orphan");
+        let seed = [field(0xEC), field(0xF0), field(0xF4), field(0xF8)];
+        assert!(
+            seed.iter().all(|&w| w != 0),
+            "{flavor:?}: every word of s_hash_seed is set: {seed:08x?}"
+        );
+
+        let dyn_dev: Arc<dyn BlockDevice> = dev.clone();
+        let fs = Filesystem::mount(dyn_dev).expect("mount");
+        assert_eq!(fs.sb.last_orphan, 0, "{flavor:?}: parsed s_last_orphan");
+        assert_eq!(fs.sb.hash_seed, seed, "{flavor:?}: parsed s_hash_seed");
+        drop(fs);
+        assert!(
+            dev.bytes.lock().unwrap()[1024..2048] == sb[..],
+            "{flavor:?}: mounting a fresh volume rewrote its superblock"
+        );
+    }
+}
+
+/// A sparse R/W device: only the 4 KiB pages that were written take memory,
+/// so a volume of several GiB can be formatted and mounted in a test.
+struct SparseDev {
+    pages: Mutex<std::collections::HashMap<u64, Vec<u8>>>,
+    size: u64,
+}
+
+const PAGE: u64 = 4096;
+
+impl BlockDevice for SparseDev {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        assert!(offset + buf.len() as u64 <= self.size, "read past EOF");
+        let pages = self.pages.lock().unwrap();
+        for (i, byte) in buf.iter_mut().enumerate() {
+            let at = offset + i as u64;
+            *byte = pages
+                .get(&(at / PAGE))
+                .map_or(0, |p| p[(at % PAGE) as usize]);
+        }
+        Ok(())
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        assert!(offset + buf.len() as u64 <= self.size, "write past EOF");
+        let mut pages = self.pages.lock().unwrap();
+        for (i, byte) in buf.iter().enumerate() {
+            let at = offset + i as u64;
+            pages
+                .entry(at / PAGE)
+                .or_insert_with(|| vec![0u8; PAGE as usize])[(at % PAGE) as usize] = *byte;
+        }
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        self.size
+    }
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+}
+
+/// The ceiling on a block group: 2^16 - 8, which e2fsprogs enforces when it
+/// opens a volume and `mke2fs` caps at.
+const MAX_BLOCKS_PER_GROUP: u32 = 65528;
+
+/// At 16 KiB blocks and larger, `8 * block_size` is more blocks than a group
+/// may hold (#429): the formatter wrote 131072 and up, which e2fsprogs
+/// refuses as a corrupt superblock. The group is capped at 65528 blocks,
+/// what `mke2fs -b <size>` chooses. 98304 blocks is one group under the old
+/// geometry and two, one full and one short, under the capped one.
+#[test]
+fn large_blocks_cap_the_group_at_the_formats_limit() {
+    for block_size in [16384u32, 32768, 65536] {
+        let size = 98_304 * u64::from(block_size);
+        let dev = Arc::new(SparseDev {
+            pages: Mutex::new(std::collections::HashMap::new()),
+            size,
+        });
+        mkfs::format_filesystem(dev.as_ref(), None, None, size, block_size)
+            .unwrap_or_else(|e| panic!("{block_size}: format: {e:?}"));
+        let dev_dyn: Arc<dyn BlockDevice> = dev.clone();
+        let fs =
+            Filesystem::mount(dev_dyn).unwrap_or_else(|e| panic!("{block_size}: mount: {e:?}"));
+        assert_eq!(
+            fs.sb.blocks_per_group, MAX_BLOCKS_PER_GROUP,
+            "{block_size}-byte blocks: blocks per group"
+        );
+        assert_eq!(fs.groups.len(), 2, "{block_size}-byte blocks: groups");
+        let report = fs_ext4::fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
+        assert!(
+            report.is_clean(),
+            "{block_size}-byte blocks: {:?}",
+            report.anomalies
+        );
+    }
 }

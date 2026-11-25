@@ -1,20 +1,25 @@
-//! Repro: the "enable systemd units" symlink edit that corrupted a Raspberry
-//! Pi OS (Bookworm) root fs when applied through the DiskJockey ext4 driver.
+//! Repro: a systemd-style `*.wants/` edit — one new directory filled with
+//! symlinks, one of them removed again — must leave a checksummed journal
+//! clean and valid.
 //!
-//! Field op set, verbatim: one `mkdir`, five `symlink` creations, one `unlink`
-//! (the pre-existing dangling `inpace.service`). On the real card the kernel
-//! then failed to mount with `JBD2: journal checksum error`.
+//! Operation sequence, in order, through the write path: one `mkdir`
+//! (`/wants`), one `symlink` to a unit that does not exist (a dangling link),
+//! four more `symlink`s to `../<unit>.service`, then `unlink` of the dangling
+//! one. Every link target is relative and short, so each is a fast symlink.
+//! Before the fix this sequence left the JBD2 superblock checksum stale, and a
+//! kernel then refused the mount with `JBD2: journal checksum error`.
 //!
 //! Structure mirrors `journal_writer_create_mkdir_link_symlink.rs`: copy a
 //! fixture, run the ops through `apply_*`, then reopen read-only and assert the
 //! journal returned to clean and every link resolves. First fixture is
-//! `ext4-csum-seed.img` (metadata_csum_seed — "the flag that broke lwext4 on
-//! the Pi SD card"); `ext4-basic.img` is the control.
+//! `ext4-csum-seed.img` (metadata_csum_seed on top of metadata_csum and
+//! has_journal); `ext4-basic.img` is the control.
 //!
-//! The mutated image is intentionally left in /tmp (path is printed) so the
-//! Alpine-VM `e2fsck` pass can validate it against a real Linux ext4 — the
+//! With `RFE_KEEP_IMAGES=1` the mutated image is left in the selected scratch
+//! directory (path is printed) so `e2fsck -fn` can validate it against a
+//! real Linux ext4 — the
 //! in-process `is_clean()` check cannot catch a bad-checksum-but-marked-clean
-//! journal, which is exactly the field symptom.
+//! journal, which is exactly the symptom.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::Filesystem;
@@ -22,35 +27,30 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
-    let dst = format!(
-        "/tmp/fs_ext4_repro_wants_{}_{tag}_{n}.img",
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
+    let dst = fs_ext4_test_support::temp_path!(
+        "fs_ext4_repro_wants_{}_{tag}_{n}.img",
         std::process::id()
     );
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn assert_clean(path: &str, tag: &str) {
     let dev = FileDevice::open(path).expect("ro reopen");
     let fs = Filesystem::mount(Arc::new(dev)).expect("remount");
-    if let Some(jsb) = fs_ext4::jbd2::read_superblock(&fs).expect("jsb") {
-        assert!(
-            jsb.is_clean(),
-            "[{tag}] journal NOT clean after the field ops (start={}) — the field bug",
-            jsb.start
-        );
-    }
+    // Both fixtures (ext4-csum-seed.img, ext4-basic.img) are built with has_journal.
+    let jsb = fs_ext4::jbd2::read_superblock(&fs)
+        .expect("jsb")
+        .unwrap_or_else(|| panic!("[{tag}] fixture has no journal superblock"));
+    assert!(
+        jsb.is_clean(),
+        "[{tag}] journal NOT clean after the field ops (start={}) — the field bug",
+        jsb.start
+    );
 }
 
 /// The JBD2 superblock checksum on disk must match a fresh recompute after our
@@ -60,12 +60,15 @@ fn assert_clean(path: &str, tag: &str) {
 fn assert_jsb_checksum_valid(path: &str, tag: &str) {
     let dev = FileDevice::open(path).expect("ro");
     let fs = Filesystem::mount(Arc::new(dev)).expect("remount");
-    let Some(jsb) = fs_ext4::jbd2::read_superblock(&fs).expect("jsb") else {
-        return;
-    };
-    if !jsb.uses_csum_v2_or_v3() {
-        return; // v1 journals carry no superblock checksum
-    }
+    // Both fixtures are built with has_journal + metadata_csum, which gives the
+    // journal journal_checksum_v3.
+    let jsb = fs_ext4::jbd2::read_superblock(&fs)
+        .expect("jsb")
+        .unwrap_or_else(|| panic!("[{tag}] fixture has no journal superblock"));
+    assert!(
+        jsb.uses_csum_v2_or_v3(),
+        "[{tag}] fixture journal has no v2/v3 checksum (expected journal_checksum_v3)"
+    );
     let (jinode, _) = fs
         .read_inode_verified(fs.sb.journal_inode)
         .expect("journal inode");
@@ -89,20 +92,12 @@ fn assert_jsb_checksum_valid(path: &str, tag: &str) {
     );
 }
 
-/// The four units enabled in the field, plus the dangling `inpace.service`
-/// that was removed first.
-const UNITS: &[&str] = &[
-    "inpace-usbdisk",
-    "inpace-app",
-    "inpace-wifi",
-    "inpace-timesync",
-];
+/// The four units the sequence enables. The dangling link is `stale.service`,
+/// created first and removed last.
+const UNITS: &[&str] = &["unit-usbdisk", "unit-app", "unit-wifi", "unit-timesync"];
 
 fn run_field_ops(img: &str, tag: &str) {
-    let Some(path) = copy_to_tmp(img, tag) else {
-        eprintln!("[{tag}] fixture {img} missing — skipping");
-        return;
-    };
+    let path = copy_to_tmp(img, tag);
 
     {
         let dev = FileDevice::open_rw(&path).expect("open_rw");
@@ -110,14 +105,14 @@ fn run_field_ops(img: &str, tag: &str) {
 
         fs.apply_mkdir("/wants", 0o755).expect("mkdir /wants");
         // the pre-existing dangling link, then the four real ones, then remove it
-        fs.apply_symlink("../inpace.service", "/wants/inpace.service")
-            .expect("symlink inpace.service");
+        fs.apply_symlink("../stale.service", "/wants/stale.service")
+            .expect("symlink stale.service");
         for u in UNITS {
             fs.apply_symlink(&format!("../{u}.service"), &format!("/wants/{u}.service"))
                 .unwrap_or_else(|e| panic!("[{tag}] symlink {u}: {e:?}"));
         }
-        fs.apply_unlink("/wants/inpace.service")
-            .expect("unlink inpace.service");
+        fs.apply_unlink("/wants/stale.service")
+            .expect("unlink stale.service");
         // fs drops here -> unmount/flush
     }
 
@@ -134,7 +129,14 @@ fn run_field_ops(img: &str, tag: &str) {
             .unwrap_or_else(|e| panic!("[{tag}] {p} not reachable after ops: {e:?}"));
     }
 
-    eprintln!("[{tag}] mutated image left for real-ext4 check at: {path}");
+    drop(fs);
+    // Kept only when asked for: tmp/ is never emptied by anything else, so
+    // an image kept on every run grows it on every run (#331).
+    if std::env::var_os("RFE_KEEP_IMAGES").is_some() {
+        eprintln!("[{tag}] mutated image left for real-ext4 check at: {path}");
+    } else {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 #[test]

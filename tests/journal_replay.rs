@@ -21,36 +21,24 @@ use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str) -> Option<String> {
+fn copy_to_tmp(name: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     // Unique-per-call: cargo runs test fns in parallel threads; a shared name
     // would race on create/delete.
-    let dst = format!(
-        "/tmp/fs_ext4_replay_{}_{n}_{}.img",
-        std::process::id(),
-        name
-    );
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    let dst =
+        fs_ext4_test_support::temp_path!("fs_ext4_replay_{}_{n}_{}.img", std::process::id(), name);
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 #[test]
 fn writable_mount_preserves_read_path() {
     // A read-write-opened copy of ext4-basic.img must mount cleanly and
     // return the same sb info as a read-only mount.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open_rw(&path).expect("open_rw");
     assert!(dev.is_writable());
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount rw");
@@ -63,9 +51,7 @@ fn writable_mount_preserves_read_path() {
 fn clean_journal_is_no_op() {
     // A freshly-built image has jsb.start == 0 (clean). replay_if_dirty
     // must return 0 and not attempt any writes.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open_rw(&path).expect("open_rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let n = journal_apply::replay_if_dirty(&fs).expect("replay_if_dirty");
@@ -78,9 +64,7 @@ fn synthetic_dirty_journal_round_trip() {
     // End-to-end: inject a descriptor+data+commit sequence into the journal
     // file, bump jsb.start so walk() sees it as dirty, replay, and assert
     // the target fs block now holds the data we wrote.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
 
     let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
     let fs = Filesystem::mount(dev.clone()).expect("mount");
@@ -115,7 +99,9 @@ fn synthetic_dirty_journal_round_trip() {
     }
     tx.add_write(target_fs_block, payload.clone())
         .expect("add_write");
-    let blocks = tx.commit().expect("commit");
+    // With the checksums the fixture's CSUM_V3 journal declares: replay
+    // takes a commit whose checksum fails for the end of the log (#81).
+    let blocks = tx.commit_for(&jsb).expect("commit");
     assert_eq!(blocks.len(), 3, "desc + data + commit");
 
     // Splice the three blocks into journal logical blocks 1, 2, 3
@@ -181,9 +167,7 @@ fn synthetic_dirty_journal_round_trip() {
 fn read_only_device_skips_replay_silently() {
     // A read-only open on a clean image: replay_if_dirty returns 0 without
     // error even though write_at would fail.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open(&path).expect("open RO");
     assert!(!dev.is_writable());
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount RO");
@@ -194,4 +178,207 @@ fn read_only_device_skips_replay_silently() {
         let _ = journal::walk(&fs, &jsb).unwrap_or_default();
     }
     fs::remove_file(path).ok();
+}
+
+/// A journal names its destinations by block number, and those numbers
+/// come off the disk of the image being mounted.
+///
+/// Replay happens at mount, before anyone has asked for a file, so a
+/// destination the filesystem does not contain is not a write to be
+/// clamped -- it is evidence the journal is not describing this
+/// filesystem, and the whole replay has to stop. The two shapes below
+/// are the ones that reach past the device: a block number beyond the
+/// last one, and a block number large enough that multiplying it by the
+/// block size wraps and lands back near the start of the device, on the
+/// boot sector and the primary superblock.
+fn plan_writing_to(fs_block: u64) -> journal::ReplayPlan {
+    journal::ReplayPlan {
+        writes: vec![journal::ReplayEntry {
+            transaction: 1,
+            fs_block,
+            // Journal logical block 0 is the journal superblock. It is
+            // mapped, so the read half of the replay succeeds and the
+            // destination is what is left to judge.
+            journal_block: 0,
+            flags: 0,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn replay_refuses_a_destination_past_the_last_block() {
+    let path = copy_to_tmp("ext4-basic.img");
+    let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
+    let fs = Filesystem::mount(dev).expect("mount");
+
+    let before = fs::metadata(&path).expect("stat").len();
+    let past_the_end = fs.sb.blocks_count;
+    let outcome = journal_apply::apply(&fs, &plan_writing_to(past_the_end));
+
+    assert!(
+        outcome.is_err(),
+        "replay wrote to block {past_the_end}, which is past the last block of a \
+         {}-block filesystem",
+        fs.sb.blocks_count
+    );
+    drop(fs);
+    let after = fs::metadata(&path).expect("stat").len();
+    assert_eq!(
+        before, after,
+        "the image grew from {before} to {after} bytes -- the write landed \
+         past the end of the device"
+    );
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn replay_refuses_a_destination_whose_byte_offset_wraps() {
+    let path = copy_to_tmp("ext4-basic.img");
+    let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
+    let fs = Filesystem::mount(dev).expect("mount");
+    let block_size = fs.sb.block_size() as u64;
+
+    // The block number whose byte offset is exactly 2^64, which wraps to
+    // 0 -- the boot sector and the primary superblock.
+    let wraps_to_zero = (u64::MAX / block_size) + 1;
+    assert_eq!(
+        wraps_to_zero.wrapping_mul(block_size),
+        0,
+        "the block size {block_size} does not divide 2^64, so this test is \
+         not exercising the wrap it claims to"
+    );
+
+    let mut before = vec![0u8; block_size as usize];
+    fs.dev.read_at(0, &mut before).expect("read block 0");
+
+    let outcome = journal_apply::apply(&fs, &plan_writing_to(wraps_to_zero));
+    assert!(
+        outcome.is_err(),
+        "replay accepted block {wraps_to_zero}, whose byte offset wraps to 0"
+    );
+
+    let mut after = vec![0u8; block_size as usize];
+    fs.dev.read_at(0, &mut after).expect("read block 0");
+    assert_eq!(
+        before, after,
+        "block 0 -- the boot sector and the primary superblock -- was overwritten"
+    );
+
+    drop(fs);
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn uncommitted_journal_does_not_replay() {
+    // End-to-end: inject a descriptor+data sequence with NO commit block into
+    // the journal, bump jsb.start so walk() sees it as dirty, replay, and
+    // assert the target fs block is unchanged.
+    let path = copy_to_tmp("ext4-basic.img");
+
+    let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
+    let fs = Filesystem::mount(dev.clone()).expect("mount");
+    let block_size = fs.sb.block_size() as u64;
+
+    // Locate journal inode's physical blocks for logical 0..4 so we can
+    // splice our synthetic transaction in.
+    let raw = fs.read_inode_raw(fs.sb.journal_inode).expect("read jinode");
+    let jinode = fs_ext4::inode::Inode::parse(&raw).expect("parse jinode");
+
+    // Read the existing JBD2 superblock so we keep its features consistent.
+    let jsb = jbd2::read_superblock(&fs)
+        .expect("read jsb")
+        .expect("journal present");
+
+    // Pick an fs block well past the superblock + BGD area to act as our
+    // replay target. For 4 KiB-block ext4-basic.img with small fs, block
+    // 100 is safe (well inside free space).
+    let target_fs_block: u64 = 100;
+    let payload_byte: u8 = 0xA5;
+
+    // Build a 1-entry transaction targeting block 100.
+    let mut tx = Transaction::begin(
+        jsb.sequence,
+        block_size as u32,
+        jsb.uses_64bit(),
+        jsb.feature_incompat & fs_ext4::jbd2::JbdIncompat::CSUM_V3.bits() != 0,
+    );
+    let mut payload = vec![0u8; block_size as usize];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = payload_byte.wrapping_add((i & 0xFF) as u8);
+    }
+    tx.add_write(target_fs_block, payload.clone())
+        .expect("add_write");
+    let blocks = tx.commit().expect("commit");
+    assert_eq!(blocks.len(), 3, "desc + data + commit");
+
+    // Splice the three blocks into journal logical blocks 1, 2, 3
+    // (logical 0 is the jsb itself; we leave it alone).
+    for (i, blk) in blocks[..blocks.len() - 1].iter().enumerate() {
+        let journal_logical = (i as u64) + 1;
+        let phys = jbd2::journal_block_to_physical(&fs, &jinode, journal_logical)
+            .expect("map journal block")
+            .expect("mapped");
+        fs.dev
+            .write_at(phys * block_size, blk)
+            .expect("write journal slot");
+    }
+
+    // Capture the target's pre-replay contents so we can assert the change.
+    // Read through `fs.dev` so the cache stays coherent — going to the
+    // raw `dev` would bypass the buffer cache `mount_inner` wrapped
+    // around the device.
+    let mut before = vec![0u8; block_size as usize];
+    fs.dev
+        .read_at(target_fs_block * block_size, &mut before)
+        .unwrap();
+
+    // Rewrite the JBD2 superblock with jsb.start = 1 (log starts at journal
+    // logical block 1). Compose a minimal dirty sb by reading + patching.
+    let jsb_phys = jbd2::journal_block_to_physical(&fs, &jinode, 0)
+        .expect("jsb phys")
+        .expect("mapped");
+    let mut jsb_bytes = vec![0u8; block_size as usize];
+    fs.dev
+        .read_at(jsb_phys * block_size, &mut jsb_bytes)
+        .unwrap();
+    // Sanity: magic must match.
+    let magic = u32::from_be_bytes(jsb_bytes[0..4].try_into().unwrap());
+    assert_eq!(magic, JBD2_MAGIC_NUMBER);
+    // Patch s_start (offset 0x1C..0x20, big-endian) to 1.
+    jsb_bytes[0x1C..0x20].copy_from_slice(&1u32.to_be_bytes());
+    fs.dev.write_at(jsb_phys * block_size, &jsb_bytes).unwrap();
+    fs.dev.flush().unwrap();
+
+    // Now re-mount so mount sees the dirty sb — actually we don't need to
+    // remount: read_superblock fetches fresh every call.
+    let n = journal_apply::replay_if_dirty(&fs).expect("replay");
+    assert_eq!(n, 0, "uncommitted blocks must never replay");
+
+    // The target fs block still holds what it held before.
+    let mut after = vec![0u8; block_size as usize];
+    fs.dev
+        .read_at(target_fs_block * block_size, &mut after)
+        .unwrap();
+    assert_eq!(after, before, "uncommitted payload became visible");
+
+    drop(fs);
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn invalid_later_replay_destination_does_not_write_a_valid_prefix() {
+    let path = copy_to_tmp("ext4-basic.img");
+    let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&path).unwrap())).unwrap();
+    let bs = fs.sb.block_size() as usize;
+    let mut before = vec![0; bs];
+    fs.dev.read_at(100 * bs as u64, &mut before).unwrap();
+    let mut plan = plan_writing_to(100);
+    plan.writes
+        .push(plan_writing_to(fs.sb.blocks_count).writes.remove(0));
+    assert!(journal_apply::apply(&fs, &plan).is_err());
+    let mut after = vec![0; bs];
+    fs.dev.read_at(100 * bs as u64, &mut after).unwrap();
+    assert_eq!(after, before, "invalid replay plan wrote a valid prefix");
+    fs::remove_file(path).unwrap();
 }

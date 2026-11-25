@@ -9,7 +9,6 @@
 use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::Write;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -19,12 +18,11 @@ const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.im
 fn scratch(label: &str) -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
     let n = C.fetch_add(1, Ordering::Relaxed);
-    let dst = PathBuf::from(format!(
-        "/tmp/fs_ext4_capi_e2e_{label}_{}_{n}.img",
+    let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
+        "fs_ext4_capi_e2e_{label}_{}_{n}.img",
         std::process::id()
     ));
-    let mut out = fs::File::create(&dst).unwrap();
-    out.write_all(&fs::read(SRC).unwrap()).unwrap();
+    fs::copy(SRC, &dst).unwrap();
     dst
 }
 

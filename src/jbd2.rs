@@ -1,6 +1,6 @@
 //! JBD2 journal superblock parser.
 //!
-//! Spec: `fs/jbd2/journal.c` + `include/linux/jbd2.h` in the Linux kernel.
+//! Spec: kernel.org/doc/html/latest/filesystems/ext4/journal.html.
 //!
 //! JBD2 writes journal metadata in **big-endian**, unlike the ext4 filesystem
 //! body which is little-endian. Every block in the journal begins with a
@@ -11,7 +11,9 @@
 //! extent tree maps the journal file. Journal block N = logical block N of
 //! that inode; convert to a physical fs block via the extent tree.
 //!
-//! Phase 1: parse only. Transaction replay (E4) lives in a separate module.
+//! This module parses the journal superblock. Walking transactions is
+//! [`crate::journal`], replaying them [`crate::journal_apply`], and writing
+//! them [`crate::journal_writer`].
 //!
 //! Layout summary:
 //! ```text
@@ -88,7 +90,7 @@ pub struct JournalSuperblock {
     pub sequence: u32,
     /// Start block of the log. **0 means clean unmount** (nothing to replay).
     pub start: u32,
-    /// Error code set by `jbd2_journal_abort`, 0 if healthy.
+    /// `s_errno`: the error an aborted journal records, 0 if healthy.
     pub errno: u32,
     /// V2-only feature flags (zero on V1 superblocks).
     pub feature_compat: u32,
@@ -108,12 +110,48 @@ pub struct JournalSuperblock {
 }
 
 impl JournalSuperblock {
+    /// The journal format supported by the checked recovery/write lifecycle.
+    /// Feature refusal is a dependency capability boundary, not filesystem damage.
+    pub fn validate_plain_recovery(&self, block_size: u32, blocks_count: u64) -> Result<()> {
+        let supported = JbdIncompat::REVOKE.bits() | JbdIncompat::BIT64.bits();
+        if self.feature_compat != 0
+            || self.feature_ro_compat != 0
+            || self.feature_incompat & !supported != 0
+        {
+            return Err(Error::Unsupported("checked lifecycle supports plain JBD2 only; checksummed/async/fast-commit journals need separate qualification"));
+        }
+        if self.block_type != JBD2_SUPERBLOCK_V2
+            || self.block_size != block_size
+            || self.first != 1
+            || self.max_len <= self.first
+            || u64::from(self.max_len) > blocks_count
+            || (self.start != 0 && (self.start < self.first || self.start >= self.max_len))
+            || self.nr_users != 1
+        {
+            return Err(Error::Corrupt("unsupported internal journal geometry"));
+        }
+        if self.errno != 0 {
+            return Err(Error::Corrupt("journal records an outstanding error"));
+        }
+        Ok(())
+    }
+
     /// True when the log has no outstanding transactions and replay is a no-op.
     pub fn is_clean(&self) -> bool {
         self.start == 0
     }
 
     /// Returns true if the journal uses v2 or v3 checksum tags.
+    /// Whether this journal uses the v3 tag layout.
+    ///
+    /// Distinct from [`Self::uses_csum_v2_or_v3`], which says whether it
+    /// is checksummed at all: the tag layout changes with V3 alone, and
+    /// confusing the two lays tags neither this crate's reader nor the
+    /// kernel can parse.
+    pub fn uses_csum_v3(&self) -> bool {
+        self.feature_incompat & JbdIncompat::CSUM_V3.bits() != 0
+    }
+
     pub fn uses_csum_v2_or_v3(&self) -> bool {
         self.feature_incompat & (JbdIncompat::CSUM_V2.bits() | JbdIncompat::CSUM_V3.bits()) != 0
     }
@@ -128,6 +166,138 @@ impl JournalSuperblock {
         self.feature_incompat & JbdIncompat::REVOKE.bits() != 0
     }
 
+    /// The `s_feature_incompat` bits this driver does not handle. Replay
+    /// and writing both refuse a journal carrying any (#81): the field's
+    /// own rule. `ASYNC_COMMIT` makes a transaction's completeness rest on
+    /// checksums alone, and `FAST_COMMIT` keeps committed updates in an
+    /// area the walker never visits.
+    pub fn unsupported_incompat(&self) -> u32 {
+        self.feature_incompat & !SUPPORTED_JBD_INCOMPAT
+    }
+
+    /// Why this journal's checksum declaration is one that cannot be
+    /// honoured, or `None` when it names a single, usable scheme.
+    ///
+    /// A journal declares at most one way of checksumming its blocks: the
+    /// v1 commit-block checksum (compat bit 0x1), or the per-block v2
+    /// (incompat 0x8) or v3 (incompat 0x10) scheme, whose checksums are
+    /// crc32c (`s_checksum_type` 4). journal.html lists the bits and the
+    /// type codes; which combinations are refused was observed in the
+    /// harness VM by patching the superblock of a clean journal (tests/
+    /// jbd2_layouts_oracle.rs): the kernel will not load, and `e2fsck -fn`
+    /// calls "Journal superblock is corrupt", exactly the three cases below.
+    /// A journal without v2 or v3 is accepted whatever its type byte says.
+    ///
+    /// Replay and the writer each support v2 and v3 one at a time, so a
+    /// journal naming both would otherwise pass the incompat check and be
+    /// read with a layout its declaration does not name.
+    pub fn checksum_declaration_error(&self) -> Option<&'static str> {
+        let has = |bit: JbdIncompat| self.feature_incompat & bit.bits() != 0;
+        let per_block = [has(JbdIncompat::CSUM_V2), has(JbdIncompat::CSUM_V3)];
+        let commit_only = self.feature_compat & JBD2_FEATURE_COMPAT_CHECKSUM != 0;
+        match per_block {
+            [false, false] => None,
+            [true, true] => Some("journal declares both CSUM_V2 and CSUM_V3"),
+            _ if commit_only => Some("journal declares v1 checksums alongside CSUM_V2/V3"),
+            _ if self.checksum_type != JBD2_CRC32C_CHKSUM => {
+                Some("journal checksum type is not crc32c")
+            }
+            _ => None,
+        }
+    }
+
+    /// The journal checksum seed: the crc32c of the journal's UUID, from
+    /// `~0`. Every transaction-block checksum starts from it.
+    pub fn csum_seed(&self) -> u32 {
+        crate::checksum::linux_crc32c(!0, &self.uuid)
+    }
+
+    /// Bytes per descriptor-block tag, not counting the 16-byte UUID that
+    /// follows a tag without the "same UUID" flag.
+    ///
+    /// journal.html describes two tag records: the v3 one (block number,
+    /// flags, high block number, 32-bit checksum -- always all four
+    /// words) and the older one (block number, 16-bit checksum, 16-bit
+    /// flags, and the high block number only under `64BIT`). It does not
+    /// say the older record's checksum slot exists only under v2; that was
+    /// measured on journals `debugfs jo`/`jw` wrote in the harness VM
+    /// (tests/jbd2_layouts_oracle.rs), where the distance between
+    /// consecutive tags is exactly this table.
+    pub fn tag_bytes(&self) -> usize {
+        let per_block_scheme = if self.uses_csum_v3() {
+            TagChecksum::V3
+        } else if self.feature_incompat & JbdIncompat::CSUM_V2.bits() != 0 {
+            TagChecksum::V2
+        } else {
+            TagChecksum::None
+        };
+        match (per_block_scheme, self.uses_64bit()) {
+            (TagChecksum::None, false) => 8,
+            (TagChecksum::None, true) => 12,
+            (TagChecksum::V2, false) => 10,
+            (TagChecksum::V2, true) => 14,
+            (TagChecksum::V3, _) => 16,
+        }
+    }
+}
+
+/// Which per-block checksum a descriptor tag carries, for [`JournalSuperblock::tag_bytes`].
+#[derive(Clone, Copy)]
+enum TagChecksum {
+    None,
+    V2,
+    V3,
+}
+
+/// `JBD2_FEATURE_COMPAT_CHECKSUM`: the v1 commit-block checksum.
+pub const JBD2_FEATURE_COMPAT_CHECKSUM: u32 = 0x1;
+
+/// `JBD2_CRC32C_CHKSUM`, the one `s_checksum_type` CSUM_V2/V3 allow.
+pub const JBD2_CRC32C_CHKSUM: u8 = 4;
+
+/// Journal incompat bits this driver replays and writes.
+pub const SUPPORTED_JBD_INCOMPAT: u32 = JbdIncompat::REVOKE.bits()
+    | JbdIncompat::BIT64.bits()
+    | JbdIncompat::CSUM_V2.bits()
+    | JbdIncompat::CSUM_V3.bits();
+
+/// Bytes a checksummed journal reserves at the end of a descriptor or
+/// revoke block for its `t_checksum` / `r_checksum` tail.
+pub const BLOCK_TAIL_BYTES: usize = 4;
+
+/// Offset of `h_chksum[0]` in a commit block (after the 12-byte header,
+/// `h_chksum_type`, `h_chksum_size` and two bytes of padding).
+pub const COMMIT_CHECKSUM_AT: usize = 16;
+
+/// A tag's checksum: crc32c of the big-endian transaction sequence then
+/// the journal copy of the block, from the journal's seed (the tag's
+/// `t_checksum` in the format documentation). CSUM_V3 stores all 32 bits;
+/// CSUM_V2 the
+/// low 16.
+pub fn tag_checksum(seed: u32, sequence: u32, data: &[u8]) -> u32 {
+    let seq = crate::checksum::linux_crc32c(seed, &sequence.to_be_bytes());
+    crate::checksum::linux_crc32c(seq, data)
+}
+
+/// A descriptor or revoke block's tail checksum: crc32c of the whole
+/// block with the last four bytes taken as zero (the format
+/// documentation's `jbd2_journal_block_tail` and `r_checksum`).
+pub fn block_tail_checksum(seed: u32, block: &[u8]) -> u32 {
+    let body = block.len().saturating_sub(BLOCK_TAIL_BYTES);
+    let crc = crate::checksum::linux_crc32c(seed, &block[..body]);
+    crate::checksum::linux_crc32c(crc, &[0u8; BLOCK_TAIL_BYTES])
+}
+
+/// A commit block's checksum: crc32c of the whole block with `h_chksum[0]`
+/// taken as zero (the format documentation's `h_chksum`).
+pub fn commit_block_checksum(seed: u32, block: &[u8]) -> u32 {
+    let at = COMMIT_CHECKSUM_AT;
+    let crc = crate::checksum::linux_crc32c(seed, &block[..at]);
+    let crc = crate::checksum::linux_crc32c(crc, &[0u8; 4]);
+    crate::checksum::linux_crc32c(crc, &block[at + 4..])
+}
+
+impl JournalSuperblock {
     /// Parse a journal superblock from its 1024-byte on-disk representation.
     /// `raw` should be at least 1024 bytes (block-size bytes in practice); we
     /// only read up to offset 0x100.
@@ -245,6 +415,113 @@ pub fn read_superblock(fs: &Filesystem) -> Result<Option<JournalSuperblock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn jsb_with(incompat: u32) -> JournalSuperblock {
+        let mut jsb = JournalSuperblock::parse(&make_v2_sb()).unwrap();
+        jsb.feature_incompat = incompat;
+        jsb
+    }
+
+    /// The tag sizes measured on debugfs-written journals: the distance
+    /// between the second and third tag of a descriptor block, for each
+    /// scheme with and without 64BIT.
+    #[test]
+    fn tag_sizes_are_the_measured_table() {
+        let b64 = JbdIncompat::BIT64.bits();
+        let v2 = JbdIncompat::CSUM_V2.bits();
+        let v3 = JbdIncompat::CSUM_V3.bits();
+        for (incompat, bytes) in [
+            (0, 8),
+            (b64, 12),
+            (v2, 10),
+            (v2 | b64, 14),
+            (v3, 16),
+            (v3 | b64, 16),
+        ] {
+            assert_eq!(
+                jsb_with(incompat).tag_bytes(),
+                bytes,
+                "incompat {incompat:#x}"
+            );
+        }
+    }
+
+    /// The accept/refuse table the kernel and e2fsck gave for patched
+    /// journal superblocks (tests/jbd2_layouts_oracle.rs runs it live).
+    #[test]
+    fn checksum_declarations_follow_the_observed_table() {
+        let v2 = JbdIncompat::CSUM_V2.bits();
+        let v3 = JbdIncompat::CSUM_V3.bits();
+        let v1 = JBD2_FEATURE_COMPAT_CHECKSUM;
+        let with = |compat: u32, incompat: u32, kind: u8| {
+            let mut jsb = jsb_with(incompat);
+            jsb.feature_compat = compat;
+            jsb.checksum_type = kind;
+            jsb.checksum_declaration_error().is_none()
+        };
+        let accepted = [
+            (0, 0, 0),
+            (0, 0, 4),
+            (v1, 0, 0),
+            (v1, 0, 1),
+            (v1, 0, 4),
+            (0, v2, 4),
+            (0, v3, 4),
+        ];
+        let refused = [
+            (0, v2 | v3, 4),
+            (v1, v2, 4),
+            (v1, v3, 4),
+            (0, v2, 1),
+            (0, v3, 1),
+            (0, v3, 2),
+            (0, v3, 0),
+        ];
+        for (compat, incompat, kind) in accepted {
+            assert!(
+                with(compat, incompat, kind),
+                "{compat:#x}/{incompat:#x}/{kind}"
+            );
+        }
+        for (compat, incompat, kind) in refused {
+            assert!(
+                !with(compat, incompat, kind),
+                "{compat:#x}/{incompat:#x}/{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn async_commit_and_fast_commit_are_unsupported() {
+        let known =
+            JbdIncompat::REVOKE.bits() | JbdIncompat::BIT64.bits() | JbdIncompat::CSUM_V3.bits();
+        assert_eq!(jsb_with(known).unsupported_incompat(), 0);
+        for bit in [
+            JbdIncompat::ASYNC_COMMIT.bits(),
+            JbdIncompat::FAST_COMMIT.bits(),
+            0x8000_0000,
+        ] {
+            assert_eq!(jsb_with(known | bit).unsupported_incompat(), bit);
+        }
+    }
+
+    /// The tail and commit checksums treat their own field as zero, so what
+    /// is stored there does not change them, and every other byte does.
+    #[test]
+    fn block_checksums_skip_only_their_own_field() {
+        let seed = jsb_with(0).csum_seed();
+        let mut block = vec![0x5Au8; 4096];
+        let tail = block_tail_checksum(seed, &block);
+        block[4092..].fill(0xFF);
+        assert_eq!(block_tail_checksum(seed, &block), tail);
+        let commit = commit_block_checksum(seed, &block);
+        block[COMMIT_CHECKSUM_AT..COMMIT_CHECKSUM_AT + 4].fill(0x00);
+        assert_eq!(commit_block_checksum(seed, &block), commit);
+        block[4091] ^= 1;
+        assert_ne!(block_tail_checksum(seed, &block), tail);
+        assert_ne!(commit_block_checksum(seed, &block), commit);
+        assert_ne!(tag_checksum(seed, 1, &block), tag_checksum(seed, 2, &block));
+    }
 
     /// Build a synthetic V2 superblock buffer for parser unit-testing.
     fn make_v2_sb() -> Vec<u8> {

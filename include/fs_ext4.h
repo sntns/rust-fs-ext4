@@ -1,9 +1,20 @@
 /*
  * fs_ext4.h — C ABI for the ext4rs pure-Rust ext4 driver.
  *
- * Link against libfs_ext4.a and #include this header. UTF-8 paths,
- * NULL / -1 / 0 failure sentinels with thread-local error details
- * available via fs_ext4_last_error() / fs_ext4_last_errno().
+ * Link against libfs_ext4.a and #include this header. NULL / -1 / 0
+ * failure sentinels with thread-local error details available via
+ * fs_ext4_last_error() / fs_ext4_last_errno().
+ *
+ * PATHS ARE BYTES. Every `const char *path` is read as the bytes up to
+ * its NUL and compared byte for byte against the directory entry names,
+ * which ext4 stores with no encoding. Never decoded: a name that is not
+ * UTF-8 (a latin-1 "caf\xe9.txt") is reachable by exactly its bytes, as
+ * fs_ext4_dir_next reports them. UTF-8 is a byte string too, so a UTF-8
+ * caller sees no difference. A path naming no file is ENOENT, one longer
+ * than 4096 bytes is ENAMETOOLONG, a NULL one is EINVAL; "" "/" and "//"
+ * name the root. A consumer whose own namespace requires valid UTF-8
+ * should escape such a name REVERSIBLY, so it can be turned back into
+ * these bytes. Extended-attribute names are text: not UTF-8 is EINVAL.
  *
  * MIT License — see LICENSE
  */
@@ -55,10 +66,19 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     uint64_t size;
-    uint32_t atime;
-    uint32_t mtime;
-    uint32_t ctime;
-    uint32_t crtime;        /* Creation time (ext4 extra) */
+    /* Seconds since the Unix epoch, signed and 64-bit.
+     *
+     * Widened from uint32_t in 0.6.0. ext4's on-disk base field is a
+     * SIGNED 32-bit value which the matching *_extra field extends by
+     * two further bits, so the real range is roughly 1901..2446. A
+     * uint32_t truncated everything past 2038 and turned every
+     * pre-1970 date into a far-future one.
+     *
+     * THIS CHANGES THE STRUCT LAYOUT. Recompile any consumer. */
+    int64_t  atime;
+    int64_t  mtime;
+    int64_t  ctime;
+    int64_t  crtime;        /* Creation time (ext4 extra) */
     uint16_t link_count;
     fs_ext4_file_type_t file_type;
     /* Sub-second timestamp precision (added in v0.3) */
@@ -92,7 +112,7 @@ typedef struct {
  */
 typedef struct {
     /* ----- Identity ----- */
-    char     volume_name[16];     /* NUL-terminated, <= 16 bytes */
+    char     volume_name[17];     /* NUL-terminated; a label is <= 16 bytes */
     uint8_t  uuid[16];            /* raw 16-byte UUID */
     char     last_mounted[64];    /* NUL-terminated last-mount path, or "" */
 
@@ -147,6 +167,13 @@ typedef struct {
  * Must read exactly `length` bytes at `offset` into `buf`.
  * Returns 0 on success, non-zero on error.
  * `context` is the opaque pointer passed to fs_ext4_mount_with_callbacks.
+ *
+ * Alignment: on a mount whose `cfg->block_size` is greater than 1, both
+ * `offset` and `length` are always multiples of `block_size` (see
+ * fs_ext4_blockdev_cfg_t). With `block_size` 0 or 1 they are whatever the
+ * engine asks for, with no alignment at all: the superblock alone is read
+ * as 1024 bytes at offset 1024, and metadata writes can be smaller than
+ * a filesystem block.
  */
 typedef int (*fs_ext4_read_fn)(void *context, void *buf,
                                    uint64_t offset, uint64_t length);
@@ -155,6 +182,7 @@ typedef int (*fs_ext4_read_fn)(void *context, void *buf,
  * Callback for writing blocks to the device.
  * Must write exactly `length` bytes from `buf` starting at `offset`.
  * Returns 0 on success, non-zero on error.
+ * The same alignment contract as fs_ext4_read_fn applies.
  *
  * Optional — set to NULL when mounting read-only via
  * fs_ext4_mount_with_callbacks. Required (must be non-NULL) when mounting
@@ -184,7 +212,21 @@ typedef struct {
     fs_ext4_read_fn read;
     void   *context;     /* Passed to callbacks (e.g. FSBlockDeviceResource pointer) */
     uint64_t size_bytes; /* Total device/partition size */
-    uint32_t block_size; /* Physical block size (e.g. 512) */
+    /*
+     * On the mount entry points: the device's sector size — the unit it
+     * requires every request's offset and length to be a multiple of
+     * (e.g. 512 or 4096). When it is greater than 1 the driver sends the
+     * callbacks only such requests: an unaligned read is widened to the
+     * enclosing sectors, an unaligned write becomes a read-modify-write of
+     * its first and last sectors, and an aligned request passes through
+     * unchanged. The mount fails with EINVAL if it is not a power of two,
+     * does not divide `size_bytes`, or is larger than the filesystem block
+     * size. 0 or 1: no alignment; requests are passed through byte-granular.
+     *
+     * On fs_ext4_mkfs it means something else: the filesystem block size to
+     * format with (0 selects the default).
+     */
+    uint32_t block_size;
     fs_ext4_write_fn write; /* NEW in v0.1.3; NULL if read-only */
     fs_ext4_flush_fn flush; /* NEW in v0.1.3; NULL = flush is a no-op */
 } fs_ext4_blockdev_cfg_t;
@@ -210,13 +252,14 @@ fs_ext4_fs_t *fs_ext4_mount_with_callbacks(
 
 /*
  * Mount via an FsCoreDevice handle from a sister crate
- * (`qcow2_open` from am-img-qcow2, `partitions_open_slice` from
- * am-partitions, `fs_core_file_open` from am-fs-core).
+ * (`qcow2_open` from rust-img-qcow2, `partitions_open_slice` from
+ * rust-disk-partitions, `fs_core_file_open` from rust-fs-core).
  *
  * Single entry point — RO vs RW is decided by the inner device's
  * `is_writable()`, so callers don't need a `_rw` variant.
  *
- * The handle's reference count is incremented internally; the caller
+ * The underlying device's reference count is incremented internally
+ * (the handle itself is not retained); the caller
  * still owns their *FsCoreDevice and frees it via
  * `fs_core_device_close`. Closing the resulting fs_ext4_fs_t via
  * `fs_ext4_umount` drops the mount's own reference.
@@ -242,7 +285,8 @@ fs_ext4_fs_t *fs_ext4_mount_with_fs_core_device(struct FsCoreDevice *handle);
  * crate will fail until replay completes.
  *
  * Same handle-ownership semantics as fs_ext4_mount_with_fs_core_device:
- * the handle's reference count is incremented internally; the caller
+ * the underlying device's reference count is incremented internally
+ * (the handle itself is not retained); the caller
  * still owns their *FsCoreDevice and frees it via
  * `fs_core_device_close`. Closing the resulting fs_ext4_fs_t via
  * `fs_ext4_umount` drops the mount's own reference.
@@ -261,7 +305,8 @@ fs_ext4_fs_t *fs_ext4_mount_with_fs_core_device_lazy(struct FsCoreDevice *handle
  *
  * Both `cfg->read` AND `cfg->write` must be non-NULL — otherwise this
  * returns NULL with errno set to EINVAL. `cfg->flush` is optional; pass
- * NULL to make synchronize() a no-op (the caller's host I/O layer is
+ * NULL to make every device flush the driver issues -- including the one
+ * fs_ext4_flush() asks for -- a no-op (the caller's host I/O layer is
  * expected to handle stable-storage barriers in that case).
  *
  * Returns NULL on failure; use fs_ext4_last_error() / fs_ext4_last_errno()
@@ -304,6 +349,57 @@ int fs_ext4_replay_journal_if_dirty(fs_ext4_fs_t *fs);
  */
 void fs_ext4_umount(fs_ext4_fs_t *fs);
 
+/*
+ * Durability barrier for a live mount. The handle stays mounted and usable.
+ *
+ * Unmounting is NOT needed to get data out. Every mutating call already
+ * writes its changes to their final on-disk location before it returns:
+ * a journaled mount commits and checkpoints each transaction immediately,
+ * and a mount without a journal writes in ordered stages, with a device
+ * flush between each step either way. fs_ext4_flush() adds one more device
+ * flush (the `cfg->flush` callback, or fsync for a path mount) and checks
+ * that nothing is left in flight: no earlier device write or journal
+ * operation failed, and no transaction is left uncheckpointed. On return
+ * 0, every mutating call that returned before this one is on stable
+ * storage -- as far as the host's flush reaches: with a NULL `cfg->flush`
+ * it only means the bytes were handed to `cfg->write`.
+ *
+ * Safe to call while other calls on the same handle run; a mutation in
+ * progress on another thread either completes before the check or starts
+ * after it. On a read-only mount there is nothing to write back and it
+ * returns 0.
+ *
+ * Returns 0 on success, -1 on failure with fs_ext4_last_error() /
+ * fs_ext4_last_errno() set: EIO when an earlier mutation's device write or
+ * journal operation failed -- the mount can no longer vouch for the device
+ * and must be unmounted and remounted (which replays or checks) -- or the
+ * errno the host's flush surfaced.
+ */
+int fs_ext4_flush(fs_ext4_fs_t *fs);
+
+/*
+ * fs_ext4_flush(), then drop the mount's read caches and re-read the
+ * superblock and group descriptors from the device. For a host that
+ * changed the device underneath an idle mount and needs the mount to see
+ * the device as it now is. The handle stays mounted and usable.
+ *
+ * NOT concurrent-writer support: the caller must serialise -- no other
+ * call on this handle may be in flight, and nothing may write the device
+ * while this runs. A change to the volume's identity or geometry is
+ * refused (EIO) rather than adopted.
+ *
+ * A read-only mount of a volume with a dirty journal replays the journal
+ * into its cache only; the device still holds the pre-replay bytes, which
+ * a read-only mount may not change. There, fs_ext4_fresh_read() returns -1
+ * with EIO and keeps the replayed view: dropping the cache would turn
+ * committed state back into superseded state. Remount read-write (which
+ * replays onto the device) to get a physical readback.
+ *
+ * Returns 0 on success, -1 on failure with fs_ext4_last_error() /
+ * fs_ext4_last_errno() set; every fs_ext4_flush() failure applies.
+ */
+int fs_ext4_fresh_read(fs_ext4_fs_t *fs);
+
 /* ---- Volume info ---- */
 
 /*
@@ -312,6 +408,23 @@ void fs_ext4_umount(fs_ext4_fs_t *fs);
  */
 int fs_ext4_get_volume_info(fs_ext4_fs_t *fs,
                                 fs_ext4_volume_info_t *info);
+
+/*
+ * Set the volume label (s_volume_name) to the NUL-terminated `label`: at
+ * most 16 bytes, stored NUL-padded, so a 16-byte label has no terminator on
+ * disk. An empty string clears it. Written to the primary superblock and to
+ * every backup the volume's layout places, each with its checksum restamped
+ * on a metadata_csum volume, as `tune2fs -L` does.
+ *
+ * NOT concurrent: the caller must serialise -- no other call on this handle
+ * may be in flight. fs_ext4_get_volume_info() reports the new label
+ * afterwards, all 16 bytes of it.
+ *
+ * Returns 0 on success, -1 on failure with fs_ext4_last_error() /
+ * fs_ext4_last_errno() set: EINVAL for a label longer than 16 bytes,
+ * EROFS on a read-only mount.
+ */
+int fs_ext4_set_volume_label(fs_ext4_fs_t *fs, const char *label);
 
 /* ---- File attributes ---- */
 
@@ -362,8 +475,19 @@ int64_t fs_ext4_read_file(fs_ext4_fs_t *fs, const char *path,
 
 /*
  * Read symlink target.
- * Writes null-terminated target into buf (max bufsize bytes).
- * Returns 0 on success.
+ *
+ * On success writes the target followed by a NUL terminator into buf and
+ * returns the target's length in bytes, not counting the NUL, as Linux
+ * readlink(2) does.
+ *
+ * If bufsize < length + 1 it returns -1 with fs_ext4_last_errno() ==
+ * ERANGE, fs_ext4_last_error() naming the size needed, and writes nothing
+ * into buf. The target is never silently truncated (unlike readlink(2)).
+ *
+ * bufsize 0 with a non-NULL buf is only too small: ERANGE as above.
+ * NULL fs, path or buf: -1, EINVAL. Any other failure: -1
+ * with fs_ext4_last_errno() set (ENOENT, EINVAL when not a symlink, EIO,
+ * ENOTSUP for an encrypted target, ...).
  */
 int fs_ext4_readlink(fs_ext4_fs_t *fs, const char *path,
                          char *buf, size_t bufsize);
@@ -379,7 +503,9 @@ int fs_ext4_readlink(fs_ext4_fs_t *fs, const char *path,
  *
  * Returns: total bytes of output (names + NUL terminators) on success,
  *          -1 on error. If bufsize is less than the required size, writes
- *          as much as fits and still returns the required size.
+ *          as many WHOLE names as fit -- never part of one, which a caller
+ *          could not tell from a real name -- and still returns the
+ *          required size.
  */
 int64_t fs_ext4_listxattr(fs_ext4_fs_t *fs, const char *path,
                               char *buf, size_t bufsize);
@@ -410,7 +536,8 @@ const char *fs_ext4_last_error(void);
 /*
  * Get POSIX errno for the last failed FFI call (thread-local).
  * Returns 0 if the last call succeeded (or no call has been made yet).
- * Codes: ENOENT, EIO, ENOTDIR, EINVAL, ENOTSUP — or any errno surfaced
+ * Codes: ENOENT, EIO, ENOTDIR, EINVAL, ENOTSUP, ESTALE (an inode-addressed
+ * call on an inode that no longer names the file) — or any errno surfaced
  * by the underlying I/O layer (e.g. EACCES from the block device).
  * Use this alongside fs_ext4_last_error() to produce an NSError
  * with the correct POSIXErrorDomain code for FSKit.
@@ -548,7 +675,11 @@ uint32_t fs_ext4_mknod(fs_ext4_fs_t *fs, const char *path,
  *   0x00000010  EXT4_IMMUTABLE_FL
  *   0x00000020  EXT4_APPEND_FL
  *   0x00000040  EXT4_NODUMP_FL
- *   0x00000200  EXT4_NOATIME_FL
+ *   0x00000080  EXT4_NOATIME_FL
+ * Only the kernel's user-modifiable bits may change (EXT4_FL_USER_MODIFIABLE
+ * less EXTENTS, DAX and CASEFOLD); changing any other bit (INDEX, HUGE_FILE,
+ * ENCRYPT, VERITY, INLINE_DATA, ...) fails with EINVAL and changes nothing.
+ * Bits already set outside that mask may be passed back unchanged.
  * Bumps i_ctime. Returns 0 on success, -1 on failure. */
 int fs_ext4_set_flags(fs_ext4_fs_t *fs, const char *path, uint32_t flags);
 
@@ -576,15 +707,185 @@ int fs_ext4_setxattr(fs_ext4_fs_t *fs, const char *path,
 int fs_ext4_removexattr(fs_ext4_fs_t *fs, const char *path,
                         const char *name);
 
+/* Leave a timestamp unchanged: POSIX spells this UTIME_OMIT in the
+ * nanoseconds field; fs_ext4_utimens takes it in the seconds field.
+ * Not UINT32_MAX any more -- seconds are signed and 64-bit, which makes
+ * that value an ordinary date in 2106 rather than a spare bit pattern.
+ *
+ * A `static const` and not a `#define` so that Swift sees it. Swift's
+ * C importer takes simple literal macros only; `#define FS_EXT4_TIME_OMIT
+ * INT64_MIN` expands to an expression it declines to import, and the
+ * symbol is then simply absent on the Swift side. */
+static const int64_t FS_EXT4_TIME_OMIT = INT64_MIN;
+
+/* utimensat(2)'s sentinels, passed in a `*_nsec` field of
+ * fs_ext4_utimens. They are SUPPORTED, per field, with utimensat's
+ * meaning -- the `*_sec` beside either is ignored:
+ *   FS_EXT4_UTIME_NOW   set that timestamp to the current time, read
+ *                       from the mount's clock (whole seconds, so its
+ *                       nanoseconds are stored as 0);
+ *   FS_EXT4_UTIME_OMIT  leave that timestamp unchanged.
+ * The values are Linux's UTIME_NOW / UTIME_OMIT, (1 << 30) - 1 and
+ * (1 << 30) - 2. Other platforms spell them differently (macOS: -1 and
+ * -2), and those values are refused with EINVAL like any other
+ * nanosecond count of 1e9 or more -- use these names, not the
+ * platform's. `static const` for Swift, as above. */
+static const uint32_t FS_EXT4_UTIME_NOW = 0x3fffffffu;
+static const uint32_t FS_EXT4_UTIME_OMIT = 0x3ffffffeu;
+
 /* Set the access + modification times on `path`. Each `*_sec` is a
- * POSIX seconds-since-epoch value; passing UINT32_MAX leaves that pair
- * unchanged (so `atime_sec == UINT32_MAX` touches only mtime, etc).
- * `*_nsec` is sub-second nanoseconds, only written when the inode's
- * i_extra_isize region can hold them. Bumps i_ctime. Returns 0 on
- * success, -1 on failure. */
+ * POSIX seconds-since-epoch value; passing FS_EXT4_TIME_OMIT leaves that
+ * pair unchanged (so `atime_sec == FS_EXT4_TIME_OMIT` touches only
+ * mtime, etc). `*_nsec` is sub-second nanoseconds, 0..999999999, only
+ * written when the inode's i_extra_isize region can hold them; it also
+ * takes FS_EXT4_UTIME_NOW / FS_EXT4_UTIME_OMIT, above. Bumps i_ctime,
+ * unless both pairs are omitted, in which case nothing is written.
+ *
+ * The seconds are int64_t (widened from uint32_t in 0.5.0) because ext4
+ * stores a SIGNED 32-bit base extended by two epoch bits in the matching
+ * `*_extra` field -- roughly 1901..2446. The old unsigned type could
+ * express neither end: a pre-1970 date was unrepresentable, and a
+ * post-2038 date was written with the epoch bits left zero and read back
+ * 136 years early.
+ *
+ * Returns 0 on success, -1 on failure. Fails with EINVAL for a time
+ * outside that range, for one needing the epoch bits on an inode too
+ * small to hold an `*_extra` field (128-byte inodes), or for a `*_nsec`
+ * of 1e9 or more that is neither sentinel -- in every case before
+ * anything is written. */
 int fs_ext4_utimens(fs_ext4_fs_t *fs, const char *path,
-                    uint32_t atime_sec, uint32_t atime_nsec,
-                    uint32_t mtime_sec, uint32_t mtime_nsec);
+                    int64_t atime_sec, uint32_t atime_nsec,
+                    int64_t mtime_sec, uint32_t mtime_nsec);
+
+/* ---- Inode-addressed entry points ---- */
+
+/*
+ * The path functions above, with the path replaced by what a handle-based
+ * host holds instead: an inode number for an item, and a (directory inode,
+ * name) pair for a mutation. Each calls the same implementation as its path
+ * twin, so the two behave identically -- same attributes, entries, bytes
+ * and errors. A path is the wrong key for such a host: a hard link gives
+ * one inode several, and renaming a directory changes every one beneath it.
+ *
+ * GENERATIONS. Every inode argument is followed by a generation: the
+ * `generation` field of the fs_ext4_attr_t the caller read the inode number
+ * from, or FS_EXT4_GEN_ANY. A call on an inode that has been freed -- or
+ * freed and reused for a different file, whose generation differs -- or
+ * on a number that never named a file (0, past the inode table, a reserved
+ * inode other than the root 2) fails with ESTALE instead of reaching
+ * whatever occupies the slot now. With FS_EXT4_GEN_ANY only the reuse case
+ * goes undetected. A generation of exactly 0xFFFFFFFF cannot be pinned.
+ *
+ * NAMES are counted byte buffers (`name`, `name_len`), not C strings, and
+ * need not be UTF-8: a name round-trips byte for byte. A name is one
+ * directory entry: empty, or containing '/' or NUL, is EINVAL; longer than
+ * 255 bytes is ENAMETOOLONG. `.` and `..` are ordinary entries to
+ * fs_ext4_lookup_at; fs_ext4_rmdir_at refuses them (EINVAL for `.`,
+ * ENOTEMPTY for `..`) and fs_ext4_rename_at refuses them on either side
+ * (EINVAL).
+ *
+ * Return values follow the path twins where those return 0 / -1; the calls
+ * that make an inode return 0 / -1 too, and fill an optional `attr`
+ * out-parameter (NULL to skip) with the new inode's attributes, from which
+ * the caller takes its handle (`attr->inode`, `attr->generation`).
+ * Errors are reported through fs_ext4_last_error / fs_ext4_last_errno.
+ */
+#define FS_EXT4_GEN_ANY 0xFFFFFFFFu
+
+/* Look up `name` in directory `dir_ino`; fill `attr` for the inode it
+ * names. 0 on success, -1 on failure (ENOENT, ENOTDIR, ESTALE, ...). */
+int fs_ext4_lookup_at(fs_ext4_fs_t *fs, uint32_t dir_ino,
+                      uint32_t dir_generation, const char *name,
+                      size_t name_len, fs_ext4_attr_t *attr);
+
+/* fs_ext4_stat of inode `ino`. 0 on success, -1 on failure. */
+int fs_ext4_stat_ino(fs_ext4_fs_t *fs, uint32_t ino, uint32_t generation,
+                     fs_ext4_attr_t *attr);
+
+/* fs_ext4_dir_open of directory `ino`; iterate and close it with
+ * fs_ext4_dir_next / fs_ext4_dir_close. NULL on failure. */
+fs_ext4_dir_iter_t *fs_ext4_dir_open_ino(fs_ext4_fs_t *fs, uint32_t ino,
+                                         uint32_t generation);
+
+/* fs_ext4_read_file of inode `ino`: up to `length` bytes from `offset`.
+ * Returns the bytes read, or -1. */
+int64_t fs_ext4_pread_ino(fs_ext4_fs_t *fs, uint32_t ino,
+                          uint32_t generation, void *buf, uint64_t offset,
+                          uint64_t length);
+
+/* fs_ext4_readlink of inode `ino`, under the same contract: the target and
+ * a NUL written into `buf`, the target's length returned; -1 with ERANGE,
+ * nothing written, when bufsize < length + 1. */
+int fs_ext4_readlink_ino(fs_ext4_fs_t *fs, uint32_t ino,
+                         uint32_t generation, char *buf, size_t bufsize);
+
+/* fs_ext4_pwrite to inode `ino`. Returns the new size, or -1. */
+int64_t fs_ext4_pwrite_ino(fs_ext4_fs_t *fs, uint32_t ino,
+                           uint32_t generation, const void *data,
+                           uint64_t len, uint64_t offset);
+
+/* fs_ext4_truncate of inode `ino`. 0 on success, -1 on failure. */
+int fs_ext4_truncate_ino(fs_ext4_fs_t *fs, uint32_t ino,
+                         uint32_t generation, uint64_t new_size);
+
+/* fs_ext4_chmod / fs_ext4_chown / fs_ext4_utimens of inode `ino`.
+ * 0 on success, -1 on failure. */
+int fs_ext4_chmod_ino(fs_ext4_fs_t *fs, uint32_t ino, uint32_t generation,
+                      uint16_t mode);
+int fs_ext4_chown_ino(fs_ext4_fs_t *fs, uint32_t ino, uint32_t generation,
+                      uint32_t uid, uint32_t gid);
+int fs_ext4_utimens_ino(fs_ext4_fs_t *fs, uint32_t ino, uint32_t generation,
+                        int64_t atime_sec, uint32_t atime_nsec,
+                        int64_t mtime_sec, uint32_t mtime_nsec);
+
+/* fs_ext4_create / fs_ext4_mkdir / fs_ext4_mknod of entry `name` in
+ * directory `dir_ino`. 0 on success with `attr` (may be NULL) filled for
+ * the new inode, -1 on failure. */
+int fs_ext4_create_at(fs_ext4_fs_t *fs, uint32_t dir_ino,
+                      uint32_t dir_generation, const char *name,
+                      size_t name_len, uint16_t mode, fs_ext4_attr_t *attr);
+int fs_ext4_mkdir_at(fs_ext4_fs_t *fs, uint32_t dir_ino,
+                     uint32_t dir_generation, const char *name,
+                     size_t name_len, uint16_t mode, fs_ext4_attr_t *attr);
+int fs_ext4_mknod_at(fs_ext4_fs_t *fs, uint32_t dir_ino,
+                     uint32_t dir_generation, const char *name,
+                     size_t name_len, uint16_t mode, uint32_t major,
+                     uint32_t minor, fs_ext4_attr_t *attr);
+
+/* fs_ext4_symlink: entry `name` in directory `dir_ino` pointing at the
+ * NUL-terminated `target` (bytes; need not be UTF-8). 0 on success with
+ * `attr` (may be NULL) filled for the new symlink, -1 on failure. */
+int fs_ext4_symlink_at(fs_ext4_fs_t *fs, uint32_t dir_ino,
+                       uint32_t dir_generation, const char *name,
+                       size_t name_len, const char *target,
+                       fs_ext4_attr_t *attr);
+
+/* fs_ext4_link: a new entry `name` in directory `dir_ino` for inode
+ * `ino`. 0 on success with `attr` (may be NULL) filled for `ino`, -1 on
+ * failure (EISDIR for a directory). */
+int fs_ext4_link_at(fs_ext4_fs_t *fs, uint32_t ino, uint32_t generation,
+                    uint32_t dir_ino, uint32_t dir_generation,
+                    const char *name, size_t name_len, fs_ext4_attr_t *attr);
+
+/* fs_ext4_unlink / fs_ext4_rmdir of entry `name` in directory `dir_ino`.
+ * 0 on success, -1 on failure. */
+int fs_ext4_unlink_at(fs_ext4_fs_t *fs, uint32_t dir_ino,
+                      uint32_t dir_generation, const char *name,
+                      size_t name_len);
+int fs_ext4_rmdir_at(fs_ext4_fs_t *fs, uint32_t dir_ino,
+                     uint32_t dir_generation, const char *name,
+                     size_t name_len);
+
+/* fs_ext4_rename2 of entry `src_name` in directory `src_dir_ino` to entry
+ * `dst_name` in directory `dst_dir_ino`, with the same `flags`
+ * (FS_EXT4_RENAME_REPLACE). Renaming an entry to itself succeeds and
+ * writes nothing; moving a directory into its own subtree is EINVAL.
+ * 0 on success, -1 on failure. */
+int fs_ext4_rename_at(fs_ext4_fs_t *fs, uint32_t src_dir_ino,
+                      uint32_t src_dir_generation, const char *src_name,
+                      size_t src_name_len, uint32_t dst_dir_ino,
+                      uint32_t dst_dir_generation, const char *dst_name,
+                      size_t dst_name_len, int flags);
 
 /* ---- Volume creation (mkfs) ---- */
 
@@ -649,9 +950,14 @@ typedef void (*fs_ext4_fsck_progress_fn)(void *context,
  * Per-finding callback. `kind` is one of: "link_count_low",
  * "link_count_high", "dangling_entry", "wrong_dotdot", "bogus_entry",
  * "duplicate_dir_inode", "block_group_free_count_drift",
- * "superblock_free_count_drift". `inode` is the most relevant inode
- * (affected inode for link-count cases; child for dangling_entry and
- * bogus_entry; directory for wrong_dotdot; duplicated dir inode for
+ * "superblock_free_count_drift", "dir_block_checksum",
+ * "unreadable_directory". `inode` is the
+ * most relevant inode (affected inode for link-count cases; child for
+ * dangling_entry and bogus_entry; directory for wrong_dotdot and
+ * dir_block_checksum, whose detail names the logical block and whether
+ * it is an htree index; directory for unreadable_directory, whose inode
+ * or entries could not be read and whose detail names the error;
+ * duplicated dir inode for
  * duplicate_dir_inode; group_index for block_group_free_count_drift;
  * 0 for superblock_free_count_drift — i.e. for the drift kinds the
  * field is overloaded and does not carry an inode number). `detail`
@@ -681,6 +987,10 @@ typedef struct {
      *   - bogus_entry (dirent file_type vs. inode mode mismatch)
      *   - dangling_entry (link-count rescue when child is readable)
      *   - block_group_free_count_drift / superblock_free_count_drift
+     *   - dir_block_checksum, for a linear block that passes the
+     *     structural checks (an htree index stays reported)
+     * No repair restamps a directory block whose checksum fails unless
+     * it is repairing that block's dir_block_checksum finding.
      * Other anomalies are still detected and reported but not
      * modified. When 0 (or `read_only` == 1) the run is purely
      * diagnostic. Must be 0 or 1; other values are rejected as

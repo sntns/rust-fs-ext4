@@ -12,28 +12,189 @@
 //!                              ▼
 //!                   journal_apply::apply  ──▶ final-location disk writes
 //!
-//! Mount flow (when journal is dirty):
+//! Mount flow (when journal is dirty), in [`replay_if_dirty`]:
 //!
 //! ```text
-//!   1. Parse JBD2 superblock via jbd2::read_superblock.
-//!   2. If !is_clean() AND dev.is_writable():
-//!        plan = journal::walk(&fs, &jsb)?
-//!        journal_apply::apply(&fs, &plan)?
-//!        jbd2::mark_journal_clean(&fs, &jsb)?   // future E11 follow-up
-//!   3. Continue read-only mount.
+//!   1. A read-only device: return, replaying nothing here. Mount replays
+//!      into the buffer cache instead ([`replay_into_cache`], #72).
+//!   2. Parse the JBD2 superblock via jbd2::read_superblock; clean: clear a
+//!      leftover needs_recovery and return.
+//!   3. Refuse a volume with a write-breaking INCOMPAT bit.
+//!   4. plan = journal::walk(&fs, &jsb)?; journal_apply::apply(&fs, &plan)?
+//!   5. Mark the journal clean, then clear needs_recovery.
+//!   6. The mount continues, read-write.
 //! ```
 //!
-//! Safety: we do NOT yet clear `jsb.start` after apply — that would signal
-//! "clean unmount" and kernel tools would skip replay. Leaving it set means
-//! replaying twice is a no-op (each write is idempotent), so it's safe to
-//! defer the start-field update to a future commit. The kernel itself
-//! tolerates repeated replays.
+//! Once the writes are flushed, the journal superblock gets `s_start = 0`
+//! and the sequence one past the first uncommitted transaction, and the ext4
+//! superblock loses `needs_recovery` (#228). Left dirty, every later mount
+//! replayed the same log again and `e2fsck` reported a journal with data
+//! in it. The order matters: a crash between the two leaves a clean
+//! journal flagged for recovery, which recovers nothing; the reverse would
+//! be a live journal Linux wipes.
 
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use crate::inode::Inode;
 use crate::jbd2::{self, JournalSuperblock};
 use crate::journal::ReplayPlan;
+
+/// Set or clear `INCOMPAT_RECOVER` (`needs_recovery`) in a 1024-byte
+/// superblock image, redoing its checksum under `metadata_csum`.
+pub(crate) fn set_needs_recovery_in(sb: &mut [u8], on: bool) {
+    let recover = crate::features::Incompat::RECOVER.bits();
+    let incompat = u32::from_le_bytes(sb[0x60..0x64].try_into().unwrap());
+    let incompat = if on {
+        incompat | recover
+    } else {
+        incompat & !recover
+    };
+    sb[0x60..0x64].copy_from_slice(&incompat.to_le_bytes());
+    let ro_compat = u32::from_le_bytes(sb[0x64..0x68].try_into().unwrap());
+    if ro_compat & crate::features::RoCompat::METADATA_CSUM.bits() != 0 {
+        let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+    }
+}
+
+/// Set or clear `needs_recovery` in the primary superblock on `dev`. Linux
+/// replays a journal only when this is set, and wipes one when it is not.
+pub(crate) fn write_needs_recovery(dev: &dyn crate::block_io::BlockDevice, on: bool) -> Result<()> {
+    let at = crate::superblock::SUPERBLOCK_OFFSET;
+    let mut sb = vec![0u8; 1024];
+    dev.read_at(at, &mut sb)?;
+    set_needs_recovery_in(&mut sb, on);
+    dev.write_at(at, &sb)
+}
+
+/// Clear `needs_recovery` in the primary superblock, and in the same write
+/// set its free block and inode counts to the sums over the group
+/// descriptors.
+///
+/// Those two summary counts are the one part of a crashed volume the
+/// descriptors do not vouch for. The kernel keeps them in memory and writes
+/// them back lazily, not with each transaction, so its log carries the
+/// descriptors' counts and leaves the superblock's behind; once the log is
+/// replayed, `e2fsck -fn` reports "Free blocks count wrong" and "Free
+/// inodes count wrong" until something recounts (#506,
+/// `tests/lazy_write_over_kernel_log.rs`). Recovery is where the volume is
+/// brought back to consistent, so the recount happens here.
+fn finish_recovery(fs: &Filesystem) -> Result<()> {
+    let at = crate::superblock::SUPERBLOCK_OFFSET;
+    let mut raw = vec![0u8; 1024];
+    fs.dev.read_at(at, &mut raw)?;
+    let sb = crate::superblock::Superblock::parse(raw.clone())?;
+    let csum = crate::checksum::Checksummer::from_superblock(&sb);
+    let groups = crate::bgd::read_all(fs.dev.as_ref(), &sb, &csum)?;
+    let free_blocks: u64 = groups.iter().map(|g| g.free_blocks_count as u64).sum();
+    let free_inodes: u64 = groups.iter().map(|g| g.free_inodes_count as u64).sum();
+    let free_inodes = u32::try_from(free_inodes).map_err(|_| {
+        Error::Corrupt("journal_apply: the group descriptors count more free inodes than fit")
+    })?;
+    raw[0x0C..0x10].copy_from_slice(&(free_blocks as u32).to_le_bytes());
+    if sb.is_64bit() {
+        raw[0x158..0x15C].copy_from_slice(&((free_blocks >> 32) as u32).to_le_bytes());
+    }
+    raw[0x10..0x14].copy_from_slice(&free_inodes.to_le_bytes());
+    // Clearing the flag re-stamps the checksum over the counts as well.
+    set_needs_recovery_in(&mut raw, false);
+    fs.dev.write_at(at, &raw)
+}
+
+/// Record a replayed journal as done: `s_start = 0` and `s_sequence` the one
+/// past the first uncommitted transaction, checksum redone, flushed.
+fn mark_journal_clean(fs: &Filesystem, jsb: &JournalSuperblock, plan: &ReplayPlan) -> Result<()> {
+    let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
+    let jinode = Inode::parse(&raw)?;
+    let phys = jbd2::journal_block_to_physical(fs, &jinode, 0)?
+        .ok_or(Error::Corrupt("journal_apply: journal superblock unmapped"))?;
+    let at = byte_offset_of(fs, phys)?;
+    let mut buf = vec![0u8; 1024];
+    fs.dev.read_at(at, &mut buf)?;
+    if u32::from_be_bytes(buf[0..4].try_into().unwrap()) != jbd2::JBD2_MAGIC_NUMBER {
+        return Err(Error::Corrupt(
+            "journal_apply: journal superblock lost its magic during replay",
+        ));
+    }
+    // Restart the log one past the first transaction the walk did not find
+    // committed, skipping that ID rather than reusing it: a torn tail may
+    // already carry it, and
+    // reusing it could let a stale block pass as part of the next transaction.
+    // `next_sequence` rather than `last_commit`, whose 0 is also a real ID.
+    let sequence = plan.next_sequence.unwrap_or(jsb.sequence).wrapping_add(1);
+    buf[0x18..0x1C].copy_from_slice(&sequence.to_be_bytes());
+    buf[0x1C..0x20].copy_from_slice(&0u32.to_be_bytes());
+    if jsb.uses_csum_v2_or_v3() {
+        buf[0xFC..0x100].fill(0);
+        let csum = crate::checksum::linux_crc32c(!0, &buf);
+        buf[0xFC..0x100].copy_from_slice(&csum.to_be_bytes());
+    }
+    fs.dev.write_at(at, &buf)?;
+    fs.dev.flush()
+}
+
+/// Where a block number lands on the device, or a refusal.
+///
+/// Replay is the one operation that writes to a block number the image
+/// itself chose. It runs at mount, before anybody has asked for a file,
+/// and the number comes from a descriptor tag inside the journal --
+/// which is to say, from whoever wrote the image.
+///
+/// Two things go wrong when that number is taken on trust:
+///
+///   - a block past the end of the filesystem writes past the end of the
+///     device. Against a file-backed image that is not an error at all;
+///     the file simply grows, and a tag naming block 0xDEADBEEF turns a
+///     16 MiB image into a 15 TB one.
+///   - a block number above `2^64 / block_size` wraps. At a 4 KiB block
+///     size, block `2^52` multiplies out to exactly 0 -- the boot sector
+///     and the primary superblock -- and the replay overwrites them with
+///     contents the image supplied, then reports success.
+///
+/// Neither is a write to be clamped into range. A destination the
+/// filesystem does not contain means the journal is not describing this
+/// filesystem, so the replay stops and the mount fails rather than
+/// applying the part of it that happened to be in range.
+pub(crate) fn byte_offset_of(fs: &Filesystem, block: u64) -> Result<u64> {
+    byte_offset_in(
+        block,
+        fs.sb.blocks_count,
+        fs.sb.block_size(),
+        fs.dev.size_bytes(),
+    )
+}
+
+/// The same rule, for callers that hold the pieces rather than the
+/// `Filesystem` -- `journal_writer` writes through a `&dyn BlockDevice`
+/// after the mount has gone out of scope.
+pub(crate) fn byte_offset_in(
+    block: u64,
+    blocks_count: u64,
+    block_size: u32,
+    device_bytes: u64,
+) -> Result<u64> {
+    if block >= blocks_count {
+        return Err(Error::Corrupt(
+            "journal: names a block past the end of the filesystem",
+        ));
+    }
+    let block_size = block_size as u64;
+    let offset = block
+        .checked_mul(block_size)
+        .ok_or(Error::Corrupt("journal: block offset overflows"))?;
+    // `blocks_count` is the image's own claim about its size, so a
+    // truncated image passes the check above and still reaches past the
+    // device. The device is asked directly.
+    let end = offset
+        .checked_add(block_size)
+        .ok_or(Error::Corrupt("journal: block offset overflows"))?;
+    if end > device_bytes {
+        return Err(Error::Corrupt(
+            "journal: names a block past the end of the device",
+        ));
+    }
+    Ok(offset)
+}
 
 /// Apply all writes in `plan` to `fs.dev`. Each `ReplayEntry` names a
 /// journal-block source and a fs-block destination; we read the source
@@ -53,19 +214,22 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
         ));
     }
 
-    let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
-    let jinode = Inode::parse(&raw)?;
     let block_size = fs.sb.block_size() as u64;
 
+    // EVERY ENTRY IS RESOLVED BEFORE ANY IS WRITTEN. Checked inside the
+    // write loop, a bad destination was found after the entries before it
+    // were already on disk, and the mount failed over a filesystem it had
+    // half replayed (#150). A refusal is only free before the first write.
+    //
+    // Source: journal_block is a logical block inside the journal inode,
+    // resolved to a physical fs block via the extent tree. Destination:
+    // fs_block, bounds-checked against the filesystem and the device.
+    let resolved = resolve(fs, plan)?;
+
     let mut applied = 0usize;
-    for w in &plan.writes {
-        // Source: journal_block is a logical block inside the journal inode.
-        // Resolve to a physical fs block via the extent tree, then read one
-        // full block.
-        let phys = jbd2::journal_block_to_physical(fs, &jinode, w.journal_block)?
-            .ok_or(Error::Corrupt("journal_apply: journal block unmapped"))?;
+    for (w, &(source, destination)) in plan.writes.iter().zip(&resolved) {
         let mut buf = vec![0u8; block_size as usize];
-        fs.dev.read_at(phys * block_size, &mut buf)?;
+        fs.dev.read_at(source, &mut buf)?;
 
         // If the ESCAPED flag is set, the first 4 bytes of the journal block
         // were zeroed during write to keep them from colliding with the
@@ -74,8 +238,7 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
             buf[0..4].copy_from_slice(&crate::jbd2::JBD2_MAGIC_NUMBER.to_be_bytes());
         }
 
-        // Destination: fs_block * block_size = byte offset on the device.
-        fs.dev.write_at(w.fs_block * block_size, &buf)?;
+        fs.dev.write_at(destination, &buf)?;
         applied += 1;
     }
 
@@ -88,18 +251,75 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
     Ok(applied)
 }
 
+/// Replay a dirty journal into the device's buffer cache, writing nothing
+/// (#72).
+///
+/// A transaction in a dirty journal is committed: the filesystem told its
+/// caller the change was durable and had not yet checkpointed it. A
+/// read-only mount that skipped replay read the superseded metadata and
+/// reported it as fact. This walks the journal exactly as
+/// [`replay_if_dirty`] does, with every refusal the walk makes, and pins
+/// each replayed block's bytes in the cache (`populate_cache`) instead of
+/// writing them, so reads see the committed state and the device stays
+/// untouched.
+///
+/// Returns the number of blocks pinned: 0 for a clean journal or none.
+pub fn replay_into_cache(fs: &Filesystem) -> Result<usize> {
+    let Some(jsb) = jbd2::read_superblock(fs)? else {
+        return Ok(0);
+    };
+    if jsb.is_clean() {
+        return Ok(0);
+    }
+    let plan = crate::journal::walk(fs, &jsb)?;
+    if plan.writes.is_empty() {
+        return Ok(0);
+    }
+    let block_size = fs.sb.block_size() as u64;
+    let resolved = resolve(fs, &plan)?;
+    // Read every source before pinning any, so a failed read leaves the
+    // cache as it was rather than half replayed.
+    let mut blocks = Vec::with_capacity(plan.writes.len());
+    for (w, &(source, _)) in plan.writes.iter().zip(&resolved) {
+        let mut buf = vec![0u8; block_size as usize];
+        fs.dev.read_at(source, &mut buf)?;
+        if w.flags & crate::journal::TAG_ESCAPED != 0 {
+            buf[0..4].copy_from_slice(&crate::jbd2::JBD2_MAGIC_NUMBER.to_be_bytes());
+        }
+        blocks.push((w.fs_block, buf));
+    }
+    // In log order, so a block a later transaction rewrote ends with its
+    // later bytes.
+    let n = blocks.len();
+    for (block, bytes) in blocks {
+        fs.dev.populate_cache(block, bytes);
+    }
+    Ok(n)
+}
+
+/// Each entry's journal source and filesystem destination as device byte
+/// offsets, or the refusal for the first that has none.
+fn resolve(fs: &Filesystem, plan: &ReplayPlan) -> Result<Vec<(u64, u64)>> {
+    let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
+    let jinode = Inode::parse(&raw)?;
+    plan.writes
+        .iter()
+        .map(|w| {
+            let phys = jbd2::journal_block_to_physical(fs, &jinode, w.journal_block)?
+                .ok_or(Error::Corrupt("journal_apply: journal block unmapped"))?;
+            Ok((byte_offset_of(fs, phys)?, byte_offset_of(fs, w.fs_block)?))
+        })
+        .collect()
+}
+
 /// Convenience: mount-time entry point. Reads the journal superblock and,
 /// if the journal is dirty AND the device is writable, walks + applies in
 /// one shot. Returns the number of blocks replayed (0 if clean or device
 /// is read-only — the latter is not an error; mount proceeds read-only).
 pub fn replay_if_dirty(fs: &Filesystem) -> Result<usize> {
-    // Read-only mounts skip replay regardless of journal state — the read
-    // path tolerates a non-clean journal (pending transactions are
-    // invisible, which is correct for a read-only view of a dirty image).
-    // Checking this BEFORE `read_superblock` matters for ext3: the journal
-    // inode's i_block holds legacy indirect pointers, and the deeper code
-    // currently bails on non-extent journals. RO mounts have no business
-    // touching the journal at all, so we exit early here.
+    // A read-only device cannot take a replay. Mount replays a dirty
+    // journal into the cache instead (`replay_into_cache`, #72); this entry
+    // point is the one that writes.
     if !fs.dev.is_writable() {
         return Ok(0);
     }
@@ -107,10 +327,28 @@ pub fn replay_if_dirty(fs: &Filesystem) -> Result<usize> {
         return Ok(0); // no journal inode → nothing to replay
     };
     if jsb.is_clean() {
+        // A crash between the clean journal and the cleared flag leaves
+        // the flag behind with nothing to recover, and the summary counts
+        // as stale as after any other crash.
+        if fs.sb.feature_incompat & crate::features::Incompat::RECOVER.bits() != 0 {
+            finish_recovery(fs)?;
+            fs.dev.flush()?;
+        }
         return Ok(0);
     }
+    // Replay writes to the volume, so it refuses what every other write
+    // refuses. The mount checks these bits too, but a lazy mount checked
+    // while it was read-only and calls this once it is writable (#117).
+    let write_breaking = crate::features::write_breaking_incompat(fs.sb.feature_incompat);
+    if write_breaking != 0 {
+        return Err(crate::Error::UnsupportedIncompat(write_breaking));
+    }
     let plan = crate::journal::walk(fs, &jsb)?;
-    apply(fs, &plan)
+    let applied = apply(fs, &plan)?;
+    mark_journal_clean(fs, &jsb, &plan)?;
+    finish_recovery(fs)?;
+    fs.dev.flush()?;
+    Ok(applied)
 }
 
 /// Describe the JBD2 superblock fields most relevant to replay decisions.
@@ -154,6 +392,21 @@ mod tests {
         // touches it. Skipping — the integration test in tests/ covers the
         // live path.
         assert!(plan.writes.is_empty());
+    }
+
+    /// The overflow branch itself. `blocks_count` and the device size are
+    /// both `u64::MAX` so neither bounds check can refuse the block first:
+    /// only `checked_mul` stands between this block and a byte offset that
+    /// wraps to 0, the boot sector and the primary superblock.
+    #[test]
+    fn byte_offset_in_refuses_a_block_whose_offset_wraps() {
+        let block_size = 4096u32;
+        let wraps_to_zero = u64::MAX / block_size as u64 + 1;
+        assert_eq!(wraps_to_zero.wrapping_mul(block_size as u64), 0);
+        match byte_offset_in(wraps_to_zero, u64::MAX, block_size, u64::MAX) {
+            Err(Error::Corrupt(msg)) => assert_eq!(msg, "journal: block offset overflows"),
+            other => panic!("block {wraps_to_zero} was not refused as an overflow: {other:?}"),
+        }
     }
 
     #[test]

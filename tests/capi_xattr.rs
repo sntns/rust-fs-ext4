@@ -1,6 +1,6 @@
 //! C ABI smoke tests for fs_ext4_listxattr + fs_ext4_getxattr.
 //!
-//! Image layout (built by test-disks/build-ext4-feature-images.sh):
+//! Image layout (built by `chore fixtures`; recipe in test-disks/guest-build-images.sh):
 //!   /tagged.txt    user.color=red, user.com.apple.FinderInfo=<4 raw bytes>
 //!   /tagged_dir    user.purpose=documents
 //!   /plain.txt     (no xattrs)
@@ -9,7 +9,7 @@ use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
-const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-xattr.img");
+const TEST_IMAGE: &str = "ext4-xattr.img";
 
 fn last_err_str() -> String {
     unsafe {
@@ -22,9 +22,10 @@ fn last_err_str() -> String {
 }
 
 fn mount() -> *mut fs_ext4_fs_t {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let image = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), TEST_IMAGE);
+    let path = CString::new(image.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-    assert!(!fs.is_null(), "mount failed: {}", last_err_str());
+    assert!(!fs.is_null(), "mount {image} failed: {}", last_err_str());
     fs
 }
 
@@ -55,8 +56,14 @@ fn listxattr_writes_names_nul_separated() {
     let path = CString::new("/tagged.txt").unwrap();
 
     let mut buf = vec![0u8; 256];
-    let ret =
-        unsafe { fs_ext4_listxattr(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let ret = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert!(ret > 0, "listxattr failed: {}", last_err_str());
 
     let names = parse_nul_names(&buf[..ret as usize]);
@@ -78,8 +85,14 @@ fn listxattr_plain_file_has_no_user_xattrs() {
     let path = CString::new("/plain.txt").unwrap();
 
     let mut buf = vec![0u8; 256];
-    let ret =
-        unsafe { fs_ext4_listxattr(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let ret = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert!(ret >= 0, "listxattr failed: {}", last_err_str());
 
     let names = parse_nul_names(&buf[..ret as usize]);
@@ -170,8 +183,14 @@ fn listxattr_directory_has_xattrs() {
     let path = CString::new("/tagged_dir").unwrap();
 
     let mut buf = vec![0u8; 256];
-    let ret =
-        unsafe { fs_ext4_listxattr(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let ret = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert!(ret > 0, "listxattr on dir failed: {}", last_err_str());
 
     let names = parse_nul_names(&buf[..ret as usize]);
@@ -222,8 +241,14 @@ fn listxattr_undersized_buf_still_reports_required() {
     let path = CString::new("/tagged.txt").unwrap();
 
     let mut tiny = [0u8; 4];
-    let required =
-        unsafe { fs_ext4_listxattr(fs, path.as_ptr(), tiny.as_mut_ptr() as *mut i8, tiny.len()) };
+    let required = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            path.as_ptr(),
+            tiny.as_mut_ptr() as *mut std::ffi::c_char,
+            tiny.len(),
+        )
+    };
     // Even with a tiny buffer, return value is the full required size so
     // callers can re-allocate and retry.
     assert!(required >= 37, "expected >=37, got {required}");

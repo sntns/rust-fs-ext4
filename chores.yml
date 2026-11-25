@@ -1,0 +1,1024 @@
+version: "3"
+chore_min_version: 0.6.0
+
+# THE CONTRACT THIS FILE EXISTS TO OWN.
+#
+# How to build rust-fs-ext4 is knowledge that belongs to rust-fs-ext4. It used to
+# live in a consumer's build-fs-*.sh scripts — four of them, 757 lines between
+# them, byte-identical once you normalise the driver name, of which three
+# lines per script were actually about the filesystem: the cargo invocation,
+# the header name and the archive name.
+#
+# `staticlib` is the whole interface a consumer needs, AND IT TAKES NO
+# OUTPUT DIRECTORY. It builds into this crate's own dist/; `chore artifact`
+# prints the absolute path of that DIRECTORY, and a consumer copies its
+# contents. Nothing outside this repo should know the target triple, the
+# cargo profile, or where cargo puts things — and nothing outside it
+# chooses where the output lands.
+#
+# `artifact` PRINTS A DIRECTORY, NOT A FILE. That is the one place this
+# differs from rust-blk-probe, whose single binary lets its `artifact` name
+# a file: this crate produces libfs_ext4.a AND the headers beside it, so
+# there is no single path to name.
+#
+# THE TEST CONTRACT (the template the other filesystem repos copy; the
+# harness README's "Consumer test contract" is the general form):
+#
+#   chore siblings     check out ../rust-fs-core and ../fs-linux-test-harness
+#                      at their pinned refs
+#   chore tools        install and verify what the HOST needs: ripgrep, and
+#                      the VM (Vagrant, QEMU, KVM/HVF). NOT e2fsprogs
+#   chore fixtures     build test-disks/*.img — kernel-made, so in the
+#                      harness VM (vm:*)
+#   chore test:unit    tests that need no tool, no fixture and no VM
+#   chore test:images  tests that read a fixture but need no VM
+#   chore test:oracle  the driver writes, e2fsprogs reads back (e2fsck -fn
+#                      for consistency, debugfs for content and metadata)
+#   chore test:kernel  the driver writes, THE REAL KERNEL reads back: our
+#                      images loop-mounted by Linux in the guest
+#   chore test:lwext4  A THIRD IMPLEMENTATION reads what we wrote, and we
+#                      read what it wrote: lwext4, built in the guest
+#   chore test:vm      the whole suite compiled and run INSIDE the guest
+#   chore test         everything, exactly as CI runs it
+#
+# WHERE THINGS RUN, and why.
+#
+#   THE ORACLE TOOLS RUN IN THE GUEST, ALWAYS. e2fsprogs on a workstation
+#   is whatever that machine has — a keg-only Homebrew formula on a Mac, a
+#   distribution build on Linux, a different version per developer — and
+#   on a Mac it is not the platform these images are for at all. One
+#   Debian guest, one version, the same answers everywhere. There is no
+#   host path to fall back to: tests/test_contract.rs fails the suite if a
+#   test runs one here.
+#
+#   THE KERNEL ORACLES MOUNT IN THE GUEST, ALWAYS. A loop mount needs root
+#   and an ext4 driver; the host has neither to spare.
+#
+#   THE LINUX TESTS RUN ON LINUX. On a Linux host that is this host, and
+#   `chore test` compiles and runs them here. On a Mac nothing Linux-shaped
+#   runs natively: `chore test` runs `test:vm` instead, which builds and
+#   runs the same sources inside the guest.
+#
+# NOTHING SKIPS: a missing tool, fixture or VM fails the test that needed
+# it, naming the task that provides it.
+#
+# QUIET BY DEFAULT, --verbose ON REQUEST, AND THE BUDGET IS A NUMBER.
+#
+#   A task prints a VERDICT: one line per tier, a final count, and the path
+#   of the log holding everything else. A failure prints the excerpt.
+#   `chore test -- --verbose` (or OUTPUT_BUDGET_VERBOSE=1) streams the whole run.
+#
+#   Nothing is thrown away: every tier's output goes to tmp/logs/<tier>.log
+#   in full, including the per-call `[oracle vm]` evidence that `--show-output`
+#   produces. What changed is where it is read from.
+#
+#   Each tier carries an OUTPUT BUDGET -- a line and a byte count that fails
+#   the run (exit 65) when the tier prints more than it is allowed to, told
+#   apart from a failing suite by its status. Every budget below is MEASURED.
+#
+#   WHERE THE MEASUREMENTS COME FROM. The rows were first measured on an arm64
+#   KVM host for #257 and the oracle row again on the x86_64 CI job of #146.
+#   Four of them were re-measured for #422 from the retained tier-logs-*
+#   artifacts of run 36400527061, the CI run of a branch based on main at
+#   05d683c, because they had grown to within 8-19% of caps that stood still
+#   -- and a tier one line over its cap fails with exit 65 and nothing red
+#   inside it, which is the hardest failure here to read from a verdict line.
+#   CI is the place to measure: its absolute paths are longer than a
+#   developer's and its colour codes cost bytes, so a host measurement
+#   flatters the row.
+#
+#     tier      measured          budget            headroom, and why
+#     unit      1,068 /  62,225    1,390 /  81,000   ~30% / ~30%. RE-MEASURED
+#                                                    for #566 from the
+#                                                    tier-logs-unit artifact
+#                                                    of run 39139038148, job
+#                                                    117709441842, 7803d26:
+#                                                    the stack top holding
+#                                                    #554, #558 and #561, whose
+#                                                    code is e3ad142's (only
+#                                                    this file differs). All
+#                                                    715 tests passed in 40
+#                                                    binaries, no test chatter.
+#                                                    It failed the 1,050-line
+#                                                    cap with exit 65. #565
+#                                                    set 1,400 from #554 alone,
+#                                                    run 39129440115: 1,066 /
+#                                                    62,085. Was 765 /
+#                                                    46,832 at #417, with 819 /
+#                                                    49,891 on the #431 host;
+#                                                    earlier 530 / 31,331 for
+#                                                    #257 and 642 / 38,550 on
+#                                                    main at 05d683c (#422).
+#     images    1,081 /  47,123    1,400 /  60,000   ~29% / ~21%: not raised,
+#                                                    because a row raised
+#                                                    without a measurement
+#                                                    asking for it measures
+#                                                    nothing
+#     oracle    2,920 / 226,413    3,800 / 295,000   ~30% / ~30%. --show-output
+#                                                    is most of it, and it is
+#                                                    the evidence, so it
+#                                                    stays -- in the log.
+#                                                    RE-MEASURED for #443 on
+#                                                    the x86_64 CI job of run
+#                                                    36692879573: its
+#                                                    lost+found oracle, which
+#                                                    compares a debugfs stat
+#                                                    and two listings of our
+#                                                    volume and of mke2fs's
+#                                                    for seven layouts, put
+#                                                    the tier at 2,920 /
+#                                                    226,413 -- twenty lines
+#                                                    over 2,900 -- and it
+#                                                    failed with exit 65 and
+#                                                    nothing red inside it.
+#                                                    #445 and #447 add two
+#                                                    more oracle binaries.
+#                                                    Was 2,214 / 178,467.
+#                                                    Measured for #146 at
+#                                                    1,786 / 140,018 against
+#                                                    2,300 / 180,000, and
+#                                                    RE-MEASURED for #346 on
+#                                                    the x86_64 CI job of run
+#                                                    36400527061 (a branch on
+#                                                    main at 05d683c): the
+#                                                    checked-recovery, verdict-
+#                                                    reader and uninit-group
+#                                                    sweeps had taken it to
+#                                                    178,467 bytes, 1,533 short
+#                                                    of the cap -- about four
+#                                                    [oracle vm] lines -- and
+#                                                    this pull request's two
+#                                                    debugfs-oracle tests for
+#                                                    times past 2038 put it at
+#                                                    2,250 / 181,263 (run
+#                                                    36404048578), which failed
+#                                                    the tier with exit 65 and
+#                                                    nothing red inside it
+#     kernel      907 /  66,234    1,180 /  86,000   ~30% / ~30%. PR #602's
+#                                                    x86_64 merge-queue run
+#                                                    40603891696: 70 passing
+#                                                    tests; the 940 / 66,000
+#                                                    cap failed it with exit
+#                                                    65. Was 725 / 50,891 in
+#                                                    PR #561's
+#                                                    x86_64 merge-queue run
+#                                                    39172256275: 56 passing
+#                                                    tests, with #558's two in
+#                                                    cli_path_symlink_kernel.rs
+#                                                    and #561's two in
+#                                                    symlink_target_kernel.rs.
+#                                                    PR #558's own run
+#                                                    39172255026 printed
+#                                                    698 / 49,165 with only
+#                                                    cli_path_symlink_kernel.rs
+#                                                    added. Both passed every
+#                                                    test and failed the
+#                                                    680 / 49,000 cap with exit
+#                                                    65. Was 519 / 37,587 in
+#                                                    PR #537's
+#                                                    x86_64 merge-queue run
+#                                                    39075070772: 38 passing
+#                                                    tests, including two in
+#                                                    cli_mkdir_kernel.rs. Last
+#                                                    green main run 39066796244
+#                                                    printed 494 / 36,159 for
+#                                                    36 tests; mkdir adds 25
+#                                                    lines and six oracle calls.
+#                                                    Was 352 / 27,924 with two
+#                                                    more: group_layout_oracle.rs
+#                                                    (nine tests, two of them
+#                                                    kernel resizes) and
+#                                                    jbd2_layouts_oracle.rs (seven,
+#                                                    fourteen journal checksum
+#                                                    declarations each put to
+#                                                    e2fsck and a kernel mount).
+#                                                    Their x86_64 CI job (run
+#                                                    36630459115) printed 388 /
+#                                                    30,357 with the panic
+#                                                    messages of seven expected
+#                                                    mount refusals in it; with
+#                                                    each refusal one [kernel
+#                                                    vm] line instead, that log
+#                                                    is 352 / 27,924. Was 135 /
+#                                                    7,875 for eight tests, since
+#                                                    #428 added the
+#                                                    inline file and directory
+#                                                    write readbacks: the
+#                                                    x86_64 CI job of PR #436
+#                                                    (run 36463572328) passed
+#                                                    and printed 135 / 7,875,
+#                                                    25 bytes under 140 /
+#                                                    7,900; the file half alone
+#                                                    printed 127 / 7,055 (PR
+#                                                    #435, run 36461656858).
+#                                                    Was 108 / 6,045 for six
+#                                                    (#431, run 36435740119),
+#                                                    71 / 4,090 for five
+#                                                    (#413), 52 / 3,012 for four
+#     lwext4       65 /   5,243       85 /   6,800   ~31% / ~30%: eight tests
+#                                                    and sixteen [oracle vm]
+#                                                    lines, so one more
+#                                                    compared fixture is a
+#                                                    visible step
+#     suite     2,827 / 140,724    3,700 / 183,000   ~31% / ~30%: the whole
+#                                                    native suite, so every
+#                                                    tier above it grows this
+#                                                    one too. RE-MEASURED for
+#                                                    #443 on the x86_64 CI job
+#                                                    of run 36701295909 (its
+#                                                    suite.log artifact), 724
+#                                                    bytes over 140,000.
+#                                                    Was 2,220 / 107,754
+#     scripts      28 /   1,427       50 /   3,000   ~75%: three tests
+#     wasm        127 /   5,302      170 /   8,000   ~25% / ~34%. Lines measured
+#                                                    cold on arm64 macOS (no
+#                                                    registry cache, no build;
+#                                                    58 are crate downloads, as
+#                                                    a first CI run after a
+#                                                    Cargo.lock change prints);
+#                                                    bytes in CI (PR #312: 113
+#                                                    lines), whose longer paths
+#                                                    and colour codes cost more
+#     vm        2,972 / 148,017    3,900 / 193,000   ~31% / ~30%. RE-MEASURED
+#                                                    for #443 (suite-in-vm, run
+#                                                    36692879573), 17 bytes
+#                                                    over 148,000: the whole
+#                                                    suite, so every tier's
+#                                                    growth lands here too.
+#                                                    Was 2,347 / 114,164,
+#                                                    measured in CI
+#                                                    (suite-in-vm), which is
+#                                                    a FIRST run: the guest
+#                                                    build's per-crate lines
+#                                                    are already in it
+#     cli          29 /   1,093       40 /   1,460   ~38% / ~34%: MEASURED in CI
+#                                                    (run 36662726284, job cli),
+#                                                    with the man pages and
+#                                                    completions; 26 / 931 on
+#                                                    arm64 macOS. Every file is
+#                                                    three lines when it passes
+#                                                    and every tool a doctor
+#                                                    line, so a new one is a
+#                                                    visible step
+#
+#   Raise one DELIBERATELY when a tier grows, the way the executed-test
+#   floors are raised, and never to fit a run printing something it should
+#   not. A budget nobody can breach measures nothing, and
+#   tests/scripts/test-output-budget.sh fails a tier that has none.
+#
+#   Why it is worth a task's while: a passing run that prints three thousand
+#   lines hides the twenty that matter, and every reader pays for it --
+#   a person scrolling, a CI log viewer, and an agent working here, which
+#   re-reads its transcript on every step and so pays for one loud run many
+#   times over. See the fs-linux-test-harness README, "Output: quiet by
+#   default, --verbose on request".
+vars:
+  TRIPLE: aarch64-apple-darwin
+  LIBNAME: fs_ext4
+
+  # The sibling pins. One place, read by `chore siblings` and — through
+  # that task — by CI. URL as well as ref: the family is not all in one
+  # org, and a URL rebuilt from a repo name points at a repository that
+  # does not exist for exactly the ones that are not.
+  FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
+  # ../rust-fs-core/scripts/tier.sh reads ../rust-fs-core/scripts/output-budget.sh out of core. v0.2.11 is the
+  # first release that packages it and v0.2.13 is the first that carries the
+  # quiet-failure behaviour, so this pin cannot go back below v0.2.13 while
+  # the tiers read the wrapper from core. The floor and the semver check are
+  # core's from v0.2.16, run in place from ../rust-fs-core, and it carries the
+  # `cli` plumbing and SHARE fix that v0.2.15 brought. test:vm's guest
+  # installs its toolchain through `../rust-fs-core/scripts/guest-rust-toolchain.sh`,
+  # which v0.2.17 added. v0.2.18 is where ci-gate became core's, from that
+  # release, run as `../rust-fs-core/scripts/ci-gate.sh`. It is v0.2.23 because the
+  # release tarball is core's from that release: release.yml calls its
+  # release-cli workflow, which runs `../rust-fs-core/scripts/package-cli.sh` (#481).
+  # v0.3.14 provides the shared bounded single-file export, and v0.3.15 the
+  # shared tree source recursive export adapts (#570). v0.3.17 has
+  # `CliError::refused_by_state`, the exit 4 a namespace verb gives when the
+  # volume's state refuses it (#592). v0.4.1 has `CliError::not_found`, the
+  # kind a reading verb gives a path that does not exist, and agent-core v8;
+  # v0.4.2 is that release building on Rust 1.89, as this crate's msrv needs.
+  # v0.4.3 has `cli::listing`: the arguments, defaults and bound-reached error
+  # `ls --recursive` shares with every driver (rust-fs-core#406).
+  # v0.5.1 has the three API layers (`layers` feature, rust-fs-core#454).
+  FS_CORE_REF: v0.5.1
+  LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
+  # v0.3.0 is the release with `vm.sh session`, which the test runner runs
+  # cargo through so a run ends however its command ends; v0.2.0 answers it
+  # with "unknown command".
+  # v0.4.0: concurrent `vm.sh up` calls of one machine wait for the boot
+  # under way instead of racing it, a halt that hangs is forced, and the
+  # SSH forward port is picked at boot when the configured one is taken.
+  # v0.5.3: nothing in a Mac-hosted guest writes to the shares. Before it the
+  # forwarder's receiver could empty a file the suite had just written, which
+  # failed a mount of a fresh fixture copy at random (#611, harness #84).
+  # tests/scripts/test-harness-pin-keeps-guest-off-shares.sh holds the floor.
+  # v0.5.4: VM-free checks and session interrupts work under macOS system Bash.
+  # v0.5.6 gives back what a guest deletes and says what stopped a lost guest.
+  # v0.5.8: a signal to a session stops everything its command started, within
+  # five seconds, before test.sh removes the scratch directory (#617, harness
+  # #117), and leaves the shares of a VM that stays up (harness #130).
+  # v0.6.1: the VM-free suite runs no real `sync` on the host (harness #191), so
+  # this repository's script guards over the stub engine stop flushing the
+  # machine's disks (harness #153). A macOS host now needs
+  # vagrant-notify-forwarder-christhomas 0.7.7 or newer, which `chore
+  # vm:host:check` says (harness #164).
+  # v0.7.1 (v0.7.0 is the break): every consumer on a host uses ONE shared
+  # guest, `machines/shared-<guest>/`. There is no private VM and no
+  # machine-wide limit on VMs, and nothing replaces the machinery that
+  # enforced one. FLTH_SHARED_ROOT defaults
+  # to the directory holding the main checkout, a worktree included. A
+  # session's end, `vm:test` and `vm:guest-test` leave the guest up for the
+  # next run; the `[vm]` sizes and deadline are read and ignored, the host
+  # sets FLTH_SHARED_MEMORY, FLTH_SHARED_CPUS, FLTH_SHARED_DISK and
+  # FLTH_SHARED_DEADLINE.
+  # v0.8.0: Linux needs upstream virtiofsd 1.14.0, which answers a non-UTF-8
+  # xattr name (harness #274); CI installs it with the harness's
+  # install-virtiofsd action, whose tag in .github/workflows must match this
+  # one. The shared guest is sized by a host resource profile.
+  # v0.9.1: a macOS host needs the virtiofsd port 1.14.0.1 or newer, and a
+  # grep check under pipefail no longer fails on its own match.
+  # v0.11.0: guest test concurrency follows the resource profile, and each
+  # guest run gets a private disk-backed temporary directory.
+  LINUX_HARNESS_REF: v0.11.0
+
+# The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
+# harness is a sibling that `chore siblings` itself checks out: without
+# it this file must still load far enough to run that task. Every task
+# here that needs the VM says so when the harness is absent.
+#
+# No `dir:` — see the harness's vm.chores.yml: its tasks must run from
+# this repository's root, where fs-linux-test-harness.toml is.
+includes:
+  vm:
+    taskfile: ../fs-linux-test-harness/vm.chores.yml
+    optional: true
+
+# The reaper: any chore invocation stops a VM nothing else brought down
+# (a killed `chore fixtures`, a script run by hand). Fails soft, and does
+# nothing before the harness is checked out.
+lifecycle:
+  after_all:
+    - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh reap'
+
+
+tasks:
+  siblings:
+    desc: Check out the sibling repos this crate builds and tests against, at their pinned refs
+    # init + fetch-by-ref rather than clone: a ref here may be a bare
+    # commit, which `git clone --branch` cannot name. REFUSES TO MOVE A
+    # DIRTY SIBLING — a checkout is destructive to uncommitted work.
+    cmds:
+      - |
+        set -eu
+        # SIBLINGS LIVE BESIDE THE MAIN TREE, NOT BESIDE THIS CHECKOUT.
+        #
+        # `../$name` was resolved from wherever the task ran, and a thread worktree
+        # is not next to the main checkout -- it lives under the agent's own
+        # directory. Measured on 2026-09-22 the same family resolved
+        # ../rust-fs-core to THREE different places: beside the main checkouts,
+        # beside the ntfs worktrees, and beside a consumer's. One of those
+        # was a day out of date and was winning silently for anything resolving
+        # relatively.
+        #
+        # A sibling set is a property of the machine, not of a checkout. One copy
+        # on disk is the whole point of siblings over submodules, and it holds only
+        # if every checkout of every crate agrees where that copy is.
+        # --git-common-dir names the main tree from a worktree AND from the main
+        # checkout, so this answers the same from anywhere.
+        #
+        # --path-format=absolute is required, not tidiness: without it a main
+        # checkout reports a bare `.git` and this resolves to `//$name`.
+        common="$(git rev-parse --path-format=absolute --git-common-dir)"
+        siblings_root="$(cd "$common/../.." && pwd)"
+        printf '%s\t%s\t%s\n' \
+          rust-fs-core          '{{.FS_CORE_URL}}'       '{{.FS_CORE_REF}}' \
+          fs-linux-test-harness '{{.LINUX_HARNESS_URL}}' '{{.LINUX_HARNESS_REF}}' \
+        | while IFS="$(printf '\t')" read -r name url ref; do
+            dir="$siblings_root/$name"
+            # -e, not -d: a worktree's .git is a FILE naming its gitdir, and every
+            # working copy here is a worktree, a pinned sibling included.
+            if [ ! -e "$dir/.git" ]; then
+              echo "siblings: cloning $name at $ref"
+              git init --quiet "$dir"
+              git -C "$dir" remote add origin "$url"
+              git -C "$dir" fetch --quiet origin "$ref"   # not --depth 1: merge-base needs history
+              git -C "$dir" checkout --quiet FETCH_HEAD
+              continue
+            fi
+            if [ -n "$(git -C "$dir" status --porcelain)" ]; then
+              echo "siblings: $name has uncommitted changes -- refusing to move it." >&2
+              exit 1
+            fi
+            git -C "$dir" fetch --quiet origin main
+            # A tag fetched by name lands in FETCH_HEAD, not in refs/tags, so
+            # a second run on the same checkout cannot resolve `$ref` by name.
+            git -C "$dir" fetch --quiet origin "$ref"
+            pin="$(git -C "$dir" rev-parse 'FETCH_HEAD^{commit}')"
+            # THE PIN IS A FLOOR, NOT A TARGET, AND THE SIBLING STAYS ON A BRANCH.
+            #
+            # This used to compare HEAD with the pinned ref and check out the ref
+            # whenever they differed, which had two consequences, both observed.
+            #
+            # It moved the checkout BACKWARDS. One copy of core is shared by every
+            # crate on the machine, so the oldest pin in the family won: a sibling two
+            # commits ahead was silently rewound to satisfy this repository.
+            #
+            # And checking out a tag DETACHES. Core was found detached and 52 commits
+            # stale, four days after a `chore siblings` run put it there, because a
+            # detached HEAD reads as a deliberate state and nothing complains about it.
+            # On a branch, being behind shows up in `git status` the first time anyone
+            # looks -- and a commit made in the sibling belongs to something.
+            #
+            # So: guarantee a FLOOR, and never move anyone off their branch.
+            #
+            # An earlier cut of this checked out main unconditionally, which is only a
+            # little better than the detach it replaced. rust-fs-core was found on
+            # release/v0.2.12 with an unpushed commit while a release was being cut;
+            # checking out main would have taken it away mid-cut. The previous
+            # revision of this task did worse to that same checkout on 2026-09-22 --
+            # it rewound a shared core three weeks, to a September 6th commit.
+            #
+            # If the checkout already contains the pinned ref it is left exactly as it
+            # is, on whatever branch that is. Only a checkout genuinely below the floor
+            # is moved, and only by fast-forwarding a main that is already checked out.
+            # Anything else is reported for a human, because this is one checkout
+            # shared by every crate on the machine and not this task's to hijack.
+            current="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+            if git -C "$dir" merge-base --is-ancestor "$pin" HEAD; then
+              echo "siblings: $name at or ahead of $ref (on $current)"
+            elif [ "$current" = "main" ] && git -C "$dir" merge --ff-only --quiet origin/main 2>/dev/null; then
+              echo "siblings: $name fast-forwarded to $(git -C "$dir" rev-parse --short HEAD)"
+            else
+              echo "siblings: $name is on '$current' and below $ref; this task will not move it." >&2
+              echo "          It is one checkout shared by every crate here -- move it yourself." >&2
+              exit 1
+            fi
+          done
+
+          # CARGO DOES NOT READ THIS CHECKOUT.
+          #
+          # Cargo.toml names rust-fs-core by an exact published version and
+          # no path, so the crate is built against that release from the
+          # registry, here, in CI and in the guest alike. The checkout this
+          # task pins is for core's scripts. Building against an unreleased
+          # core is a `[patch]` in a local, gitignored .cargo/config.toml with
+          # a RELATIVE path (`../rust-fs-core`), which resolves to the sibling
+          # on the host and to /rust-fs-core in the guest; an absolute path
+          # there broke test:vm once (run 35852463970, job 107154016599).
+          # docs/developing-against-core.md has the recipe.
+
+  tools:
+    desc: "Install and verify what the HOST needs: ripgrep, and the VM the oracle tools live in"
+    cmds: ['scripts/tools.sh']
+
+  fixtures:
+    desc: Build every test-disks/*.img fixture (kernel-made, in the fs-linux-test-harness VM)
+    # Up to date while the recipe is unchanged and every image exists;
+    # --force rebuilds. The VM comes down when the build ends, however
+    # it ends (build-fixtures.sh sources the harness's vm-session.sh).
+    #
+    # THIS LIST AND IMAGES IN build-fixtures.sh MUST AGREE.
+    sources:
+      - test-disks/build-fixtures.sh
+      - test-disks/guest-build-images.sh
+      - scripts/vm-setup.sh
+    generates:
+      - test-disks/ext4-basic.img
+      - test-disks/ext4-htree.img
+      - test-disks/ext4-csum-seed.img
+      - test-disks/ext4-no-csum.img
+      - test-disks/ext4-deep-extents.img
+      - test-disks/ext4-inline.img
+      - test-disks/ext4-xattr.img
+      - test-disks/ext4-acl.img
+      - test-disks/ext4-largedir.img
+      - test-disks/ext4-manyfiles.img
+      - test-disks/ext4-whole-disk.img
+    # A hung boot must not hold up the shared guest for ever.
+    timeout: 60m
+    on_timeout:
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+    cmds: ['test-disks/build-fixtures.sh']
+
+  test:unit:
+    desc: 'Tests that need no tool and no fixture: the library, the binaries, and every tests/*.rs that reaches neither'
+    # In the DEBUG profile, which is the point: overflow-checks are on
+    # here and off in release, and EXPECT_OVERFLOW_CHECKS=1 arms
+    # overflow_checks::the_build_the_gate_asked_to_check_does_check in
+    # src/lib.rs to prove it. tests/ci_profile.rs checks that the CI
+    # workflow still runs this task (the `unit` job).
+    #
+    # Which targets: scripts/test-targets.sh, derived from the tests
+    # rather than listed here. CI runs this job with no fixtures present,
+    # which is what proves the split.
+    cmds:
+      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 1390 81000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      # #536 and #538 each add one boundary/error-mapping regression in inode_api.rs.
+      # #559 adds one trailing-slash lookup regression in inode_api.rs.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh unit 443'
+
+  # EVERY TIER SAYS HOW FEW TESTS STILL COUNT AS HAVING RUN IT (#271).
+  #
+  # `tier.sh` fails a tier that PRINTS more than its budget; nothing
+  # failed a tier that printed almost nothing because it RAN almost
+  # nothing. The tiers select their targets by grep in
+  # `scripts/test-targets.sh`, so a helper renamed or a predicate edited
+  # empties a selection — and `cargo test` with no matching target exits
+  # 0, which `tier.sh` then reports as `ok (2 lines)`.
+  #
+  # EVERY FLOOR IS MEASURED, from the executed counts each floor call
+  # printed in CI run 36310164119 (main at ff0911d, 2026-09-27; the
+  # counts were the same in 36284844285 at abbb3db):
+  #
+  #   tier     executed   floor   where it ran
+  #   unit        466      440    `unit` job, and both `test` jobs
+  #   images      477      450    `test (aarch64, no KVM on this runner)`
+  #   oracle      147      140    `test (x86_64, oracles in the VM)`
+  #   kernel        4        3    `test (x86_64, oracles in the VM)`
+  #   lwext4        8        7    `test (x86_64, oracles in the VM)`
+  #   suite      1115     1060    `test (x86_64, oracles in the VM)`
+  #   vm         1115     1060    `suite in the guest (the macOS path)`
+  #
+  # About 95% of the measurement (one below it for the two small tiers),
+  # so merging two tests is not a failure and losing a test binary is.
+  # A floor only ever goes up: raise it with the run that measured the
+  # new count. tests/scripts/test-tier-floors.sh fails if a tier run
+  # through tier.sh has no floor, or if a floor passes a tier that
+  # executed one test.
+  #
+  # `scripts` has none: it prints a PASS line per shell test rather than
+  # cargo's result lines, so the counter here would read zero for a tier
+  # that ran everything.
+  test:images:
+    desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
+    # The tier CI's aarch64 job runs: GitHub's arm64 runners have no
+    # /dev/kvm, so no VM can start there, and the oracle and kernel tiers
+    # read the same images on every architecture anyway. Named as a tier
+    # rather than skipped inside the tests, so what does not run there is
+    # visible in the workflow rather than hidden in a green log.
+    cmds:
+      - '../rust-fs-core/scripts/tier.sh test:images images 1400 60000 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh images)'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh images 450'
+
+  test:oracle:
+    desc: 'The driver writes, e2fsprogs reads back — every tool call made inside the harness VM'
+    # --show-output keeps what each passing oracle test checked (the
+    # `[oracle vm]` lines: every tool invocation, where it ran and its
+    # verdict), so a green run carries its evidence rather than a count.
+    # It goes to tmp/logs/oracle.log, not the terminal -- the evidence is
+    # kept, and reading it is a choice rather than a toll. `--verbose`
+    # streams it live.
+    #
+    # NO `vm:up` HERE, deliberately. The first oracle call in each test
+    # process brings the VM up (idempotent, milliseconds when it is
+    # already running) and every later call rides one shared SSH
+    # connection. scripts/test.sh runs cargo inside a harness session
+    # (`vm.sh session`), so the run is one session on the shared guest, which
+    # ends when the tier ends however it ends and however it was started, and
+    # the guest stays up for the next run. The `after_all` reaper stops only a
+    # boot that did not finish.
+    cmds:
+      - scripts/tools.sh --check
+      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 3800 295000 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh oracle 140'
+
+  test:kernel:
+    desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
+    # The gap e2fsprogs cannot close: a volume it calls clean can still be
+    # one Linux mounts differently. These tests write with the Rust API
+    # and with the C ABI, mount read-only in the guest, and compare names,
+    # sizes, modes, xattrs, ACLs and SHA-256 of contents against what was
+    # written — plus the reverse direction, and a deliberate corruption
+    # that must fail.
+    #
+    # BUDGET: 519 lines and 37587 bytes in x86_64 merge-queue run
+    # 39075070772 (kernel.log), with all 38 tests passing. Last green main
+    # run 39066796244 printed 494 lines and 36159 bytes for 36 tests.
+    # cli_mkdir_kernel.rs adds two tests, 25 lines and six oracle calls
+    # (1428 more bytes overall). Keep that oracle evidence; 680 / 49000
+    # gives about 30% headroom over the measured log, replacing 510 / 36300.
+    # cli_xattr_kernel.rs adds one test making two oracle calls, estimated
+    # at 17 lines and about 1.1 KB, within this measured budget.
+    # cli_export_kernel.rs adds a two-test binary and six oracle calls;
+    # its earlier estimate was 40 lines and 3 KB, within this budget.
+    # RE-MEASURED: 698 lines and 49165 bytes in x86_64 merge-queue run
+    # 39172255026 (kernel.log) for PR #558, and 725 lines and 50891 bytes
+    # in run 39172256275 for PR #561, all 56 tests passing; the 680 / 49000
+    # cap failed both with exit 65. 940 / 66000 keeps about 30% headroom
+    # over the larger log, replacing 680 / 49000.
+    # RE-MEASURED: 907 lines and 66234 bytes in x86_64 merge-queue run
+    # 40603891696 (kernel.log) for PR #602, all 70 tests passing; the
+    # 940 / 66000 cap failed it with exit 65. 1180 / 86000 keeps about 30%
+    # headroom over that log, replacing 940 / 66000.
+    cmds:
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 1180 86000 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh kernel) -- --show-output'
+      # 27 executed in the merge queue on 2026-10-17 (run 38991557768);
+      # cli_ls_recursive_kernel.rs adds one, cli_rm_kernel.rs two,
+      # cli_mv_kernel.rs two, cli_ln_kernel.rs two, cli_mkdir_kernel.rs
+      # two, cli_truncate_kernel.rs three, cli_pwrite_kernel.rs four and
+      # cli_xattr_kernel.rs one and cli_export_kernel.rs two.
+      # cli_import_kernel.rs adds three cases, including a subprocess crash cut,
+      # and cli_path_symlink_kernel.rs two. symlink_target_kernel.rs adds
+      # two cases comparing the 1 KiB and 4 KiB target boundaries (#536).
+      # #538 adds one kernel-boundary case (eight block-size/mapping/feature
+      # combinations) to cli_truncate_kernel.rs.
+      # cli_export_tree_kernel.rs adds one recursive tree export case (#573)
+      # and one links-and-times case (#574), plus one damaged-file case (#571).
+      # #559 adds one trailing-slash symlink comparison in cli_path_symlink_kernel.rs.
+      # cli_export_tree_kernel.rs adds one single-file --preserve refusal case (#577).
+      # cli_import_tree_kernel.rs adds two recursive import cases (#550).
+      # cli_import_preserve_kernel.rs adds two --preserve=times,links cases (#526).
+      - 'bash ../rust-fs-core/scripts/test-floor.sh kernel 63'
+
+  test:lwext4:
+    desc: 'CROSS-VALIDATION: lwext4 — a third implementation, built in the guest — reads what we wrote, and we read what it wrote'
+    # WHY IT IS ITS OWN TIER AND NOT PART OF test:oracle. `oracle` means
+    # e2fsprogs: one tool suite, one failure mode, one budget. lwext4 is a
+    # different oracle with a different failure mode -- a whole ext4
+    # implementation that can refuse a volume outright for a feature it
+    # does not have -- and folding it in would put its verdict, its count
+    # and its output inside a number that is supposed to mean "e2fsprogs
+    # agreed". It is separate for the same reason `kernel` is.
+    #
+    # AND IT CARRIES A FLOOR. A budget fails a tier that prints too much;
+    # nothing fails a tier that prints too little because it RAN too
+    # little. This tier is one test binary: if scripts/test-targets.sh
+    # stops selecting it, `cargo test` matches nothing, exits 0 and prints
+    # a green `0 passed`. The floor is what turns that red. MEASURED, like
+    # the budgets, and raised rather than lowered: eight tests ran on this
+    # arm64 KVM host and in the pull request that added the tier, and the
+    # floor is one below that -- what it has to catch is the collapse to
+    # zero, not a refactor that merges two tests into one.
+    cmds:
+      - scripts/tools.sh --check
+      - '../rust-fs-core/scripts/tier.sh test:lwext4 lwext4 85 6800 -- scripts/test.sh --locked --profile test-opt $(scripts/test-targets.sh lwext4) -- --show-output'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh lwext4 7'
+
+  tools:wasm:
+    desc: 'Install and verify what test:wasm needs: the wasm32 target, the wasm-bindgen test runner at Cargo.lock''s version, and node'
+    cmds: ['scripts/wasm-tools.sh']
+
+  test:wasm:
+    desc: 'The browser build (wasm32-unknown-unknown): tests/wasm.rs RUN under wasm-bindgen-test in Node'
+    # RUN, NOT BUILT. std on this target compiles SystemTime::now,
+    # Instant::now and std::process::id and panics when they are called,
+    # so only running the code finds those. tests/wasm.rs formats, mounts,
+    # creates, writes and unmounts an in-memory volume; on every other
+    # target it compiles to nothing. tests/scripts/test-clock-calls.sh is
+    # the toolchain-free half: it refuses those calls anywhere in src/ but
+    # src/runtime.rs.
+    #
+    # Not part of `test`: that runs in the harness guest too, which has no
+    # Node. CI runs this in its own job, `wasm`, which ci-ok needs.
+    #
+    # FLOOR: every test in tests/wasm.rs, measured -- 2 executed when the
+    # tier was added, 3 with #294's, 4 with #295's. The file is small, so
+    # one test lost is the signal.
+    cmds:
+      - scripts/wasm-tools.sh --check
+      - 'CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner ../rust-fs-core/scripts/tier.sh test:wasm wasm 170 8000 -- cargo test --locked --target wasm32-unknown-unknown --test wasm'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh wasm 4'
+
+  test:vm:
+    desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
+    # scripts/guest-suite.sh, through the harness's [test] guest_command.
+    # The toolchain and the build directory live on the VM's own disk, so
+    # the first run pays a full build and later runs are incremental.
+    # The guest stays up afterwards, for the next run.
+    timeout: 120m
+    on_timeout:
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+    cmds:
+      # The sibling checkouts the suite runs scripts from are staged on
+      # the share first: the guest is given THIS repository, not the
+      # directory that holds it, so ../rust-fs-core has nothing to
+      # resolve to until it is put there. From the pinned checkout's
+      # HEAD, so what the guest runs is what `chore siblings` pinned and
+      # nothing uncommitted.
+      - |
+        set -eu
+        [ -x ../fs-linux-test-harness/scripts/vm.sh ] || {
+          echo "test:vm needs the harness sibling -- run 'chore siblings'." >&2
+          exit 1
+        }
+        share="$(../fs-linux-test-harness/scripts/vm.sh share)"
+        for sibling in rust-fs-core; do
+          [ -e "../$sibling/.git" ] || {
+            echo "test:vm: ../$sibling is not checked out -- run 'chore siblings'." >&2
+            exit 1
+          }
+          dest="$share/siblings/$sibling"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          git -C "../$sibling" archive --format=tar HEAD | tar -x -C "$dest"
+        done
+        # --verbose is ours, not cargo's: tier.sh reads it out of CLI_ARGS
+        # and streams, and it must not also reach the in-guest `cargo test`,
+        # where it would mean something else entirely.
+        guest_args=""
+        for arg in ${CLI_ARGS:-}; do
+          case "$arg" in --verbose|-v) continue ;; esac
+          guest_args="$guest_args $arg"
+        done
+        # shellcheck disable=SC2086  # the words are the point
+        bash ../rust-fs-core/scripts/tier.sh test:vm vm 3900 193000 -- \
+          ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
+        # cli_export_kernel.rs adds two cases to the whole-suite floor.
+        # cli_import_kernel.rs adds three more cases.
+        # #536 adds one unit case and two kernel cases.
+        # cli_export_tree_kernel.rs adds one kernel case each for #573, #574 and #571.
+        # #559 adds one unit case and one kernel case.
+        # #577 adds one kernel case.
+        # cli_import_tree_kernel.rs adds two kernel cases (#550).
+        # cli_import_preserve_kernel.rs adds two kernel cases (#526).
+        bash ../rust-fs-core/scripts/test-floor.sh vm 1078
+
+  test:
+    desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
+    # WE RUN THE LINUX TESTS ON LINUX. This host is Linux, so they run
+    # here; on a Mac there is no ext4, no loop mount and no e2fsprogs
+    # worth trusting, so the same sources are built and run inside the
+    # guest instead (`test:vm`). Not a reduced run and not a skip: the
+    # whole suite, one Linux away.
+    cmds:
+      - |
+        set -eu
+        # --verbose belongs to the whole run, and test:native's tiers are
+        # separate chore invocations: an exported variable is what reaches
+        # them, which is why tier.sh reads OUTPUT_BUDGET_VERBOSE as well as the flag.
+        case " ${CLI_ARGS:-} " in
+          *" --verbose "*|*" -v "*) export OUTPUT_BUDGET_VERBOSE=1 ;;
+        esac
+        if [ "$(uname -s)" != Linux ]; then
+          echo "test: this host is $(uname -s) -- running the Linux suite in the harness VM."
+          exec "{{.CHORE_EXE}}" test:vm
+        fi
+        "{{.CHORE_EXE}}" test:native
+
+  test:native:
+    desc: 'The suite on this (Linux) host: unit (debug), the oracles, the kernel oracles, everything (release), the scripts'
+    # Checks for the host tools and the fixtures FIRST and fails naming
+    # the task that provides them, rather than letting several hundred
+    # tests each fail on the same missing image.
+    #
+    # test:oracle and test:kernel run before the whole suite, which runs
+    # those tests again: the price (a minute) of their evidence being in
+    # every log, and of `test` staying plainly "everything".
+    cmds:
+      - task: test:unit
+      - scripts/tools.sh --check
+      - test-disks/build-fixtures.sh --check
+      - task: test:oracle
+      - task: test:kernel
+      - task: test:lwext4
+      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 3700 183000 -- scripts/test.sh --locked --profile test-opt'
+      # cli_export_kernel.rs adds two cases to the whole-suite floor.
+      # cli_import_kernel.rs adds three more cases.
+      # #536 adds one unit case and two kernel cases.
+      # cli_export_tree_kernel.rs adds one kernel case each for #573, #574 and #571.
+      # #559 adds one unit case and one kernel case.
+      # #577 adds one kernel case.
+      # cli_import_tree_kernel.rs adds two kernel cases (#550).
+      # cli_import_preserve_kernel.rs adds two kernel cases (#526).
+      - 'bash ../rust-fs-core/scripts/test-floor.sh suite 1078'
+      - task: test:scripts
+      # The command-line tools, built and staged from this checkout, then
+      # tested as installed. A separate invocation because test:cli reads
+      # PATH, and the staged directory has to come first on it.
+      - task: cli:install
+      - 'PATH="$(scripts/cli-install.sh --print-bin-dir):$PATH" "{{.CHORE_EXE}}" test:cli'
+      # THE LAST LINE: one number across the tiers, and where the detail is.
+      - scripts/test-verdict.sh unit oracle kernel lwext4 suite cli
+
+  cli:install:
+    desc: 'Build the command-line tools (release, --features cli) and stage them as an install prefix: tmp/cli/bin under every name, tmp/cli/share the man pages and completions'
+    # The layout an install has: the multi-call binary as rust-fs-ext4 and
+    # each dotted name a relative symlink to it. It prints the PATH line;
+    # `test:cli` tests whatever PATH finds, so that directory goes first.
+    cmds: ['scripts/cli-install.sh']
+
+  test:cli:
+    desc: 'The command-line tools AS INSTALLED, found on PATH: doctor first, then every tests/cli/test-*.sh'
+    # Tests the installed artifact, not a cargo target: the same suite
+    # checks `chore cli:install`'s staging (test:native puts it first on
+    # PATH) and a Homebrew install. `rust-fs-ext4 doctor` runs before any
+    # tool is tested and fails the tier if a name is missing or shadowed,
+    # naming the fix. See scripts/test-cli.sh.
+    #
+    # FLOOR: each file prints a `test result: ok. N passed` line, which
+    # test-floor.sh sums as it does cargo's. 32 checks executed when the
+    # tier was added (#442, the same in CI), 66 with fs.ext4's read verbs,
+    # 93 with fsck.ext4, 130 with the write verbs, 158 with the man pages
+    # and completions; the floor is about 95% of that. 159 executed in the
+    # merge queue on 2026-10-17 (run 38991557768); test-ls-recursive.sh
+    # adds 67, test-rm.sh 72, test-mv.sh 116 and test-ln.sh 154, mkdir
+    # --parents adds 72 to test-write.sh, truncate 92 to test-write.sh and
+    # one to test-docs.sh, write --at 106 to test-write.sh, and xattr 27
+    # to test-stat.sh and one to test-docs.sh, which the floor carries in
+    # full.
+    #
+    # BUDGET: six files printed 29 lines and 1097 bytes (cli.log of run
+    # 38995796787), and a passing file adds three lines and about 80 bytes.
+    # Ten files print 41 lines and about 1420 bytes, one line over the 40
+    # this row allowed, so it allows 46 and 1640.
+    cmds:
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 46 1640 -- scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 858'
+
+  test:scripts:
+    desc: The shell tests (tests/scripts/*.sh), every one by glob
+    # BUDGET: all script tests, including the whole-image-read guard, measured
+    # 53 lines and 3021 bytes in PR #659's CI run 45090429034 and local rerun.
+    # The v0.11.0 pin verdict is one byte longer than v0.9.1; every test passed.
+    # By glob, so a test added later needs no edit here -- a guard that
+    # has to be registered somewhere else is a guard that gets silently
+    # skipped.
+    cmds:
+      - |
+        set -eu
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 53 3021 -- bash -c '
+          set -eu
+          for t in tests/scripts/*.sh; do
+            echo "== $t"
+            bash "$t"
+          done
+        '
+
+  staticlib:
+    desc: Build the static library and its headers into this crate's dist/
+    # NO `out` ARGUMENT, deliberately. A library does not write into its
+    # consumer. It builds into its own dist/ and a consumer asks where that
+    # is — `chore artifact` prints the path. Inverting it that way means this
+    # crate can change its output layout without every consumer knowing, and
+    # it stays independently usable with no consumer at all.
+    vars:
+      OUT: 'dist'
+
+    # Freshness, replacing the 101 lines of stamp-file and mtime comparison
+    # the old scripts carried. Content checksums, so touching a file does not
+    # trigger a rebuild and reverting one does not hide behind a newer mtime.
+    #
+    # These patterns are LITERAL on purpose. chore records a fingerprint by
+    # calling fingerprint.Save WITHOUT a renderer (internal/run/run.go:313),
+    # so a pattern containing {{ }} is expanded against the raw text, matches
+    # nothing, and stores the empty-set hash — the task then never registers
+    # as up to date. Measured 2026-08-27 against chore 0.6.0.
+    sources:
+      - Cargo.toml
+      - 'src/**/*.rs'
+      - 'include/*.h'
+      # fs_core.h is a source of ours because we ship it (see the cp below).
+      # THIS PATH AND THE cp MUST AGREE, and nothing checks that they do.
+      # The sibling is pinned at the release Cargo.toml names (FS_CORE_REF;
+      # tests/ci_profile.rs holds the two equal), so its header is the one
+      # the linked core was built with; under a local `[patch]` it is the
+      # patched core itself.
+      - '../rust-fs-core/include/fs_core.h'
+      # The build reads the lock and every line of core it links, so each is a
+      # source: a lock-only bump, or a sibling re-pinned under an unchanged
+      # header, otherwise leaves an old archive standing as up to date.
+      - Cargo.lock
+      - '../rust-fs-core/Cargo.toml'
+      - '../rust-fs-core/src/**/*.rs'
+
+    # Templated, which is fine here where it is not fine above: the check
+    # renders these correctly, and every entry is an exact path rather than a
+    # glob, so a missing artifact is caught by the pattern failing to match.
+    generates:
+      - '{{.OUT}}/lib{{.LIBNAME}}.a'
+      - '{{.OUT}}/include/{{.LIBNAME}}.h'
+      # Shipped, so generated: {{.LIBNAME}}.h #includes it, and a dist/
+      # without it is a broken artifact that must not count as up to date.
+      - '{{.OUT}}/include/fs_core.h'
+
+    cmds:
+      # Idempotent, and it replaces a 25-line "is the target installed" dance:
+      # rustup answers "up to date" without touching the network when it is.
+      # It runs here rather than in the consumer because the triple is ours.
+      - 'rustup target add {{.TRIPLE}}'
+      # --locked for the reason `lint` gives: a build that may re-resolve
+      # ships dependency versions CI never tested.
+      - 'cargo build --locked --release --target {{.TRIPLE}}'
+      - 'mkdir -p "{{.OUT}}/include"'
+      # From where cargo built it, which only cargo can say: ./target,
+      # CARGO_TARGET_DIR (which may be relative), or build.target-dir in a
+      # config file. `cargo metadata` gives an absolute path for all of them.
+      # A path it cannot give leaves the cp failing rather than guessing.
+      # tests/scripts/test-staticlib-target-dir.sh holds this (#624).
+      - |
+        target_dir="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+        cp "$target_dir/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a" "{{.OUT}}/lib{{.LIBNAME}}.a"
+      - 'cp include/{{.LIBNAME}}.h "{{.OUT}}/include/{{.LIBNAME}}.h"'
+      # Shipping fs_core.h is ours: the header we emit #includes it, so a
+      # consumer handed only fs_ext4.h cannot compile.
+      - 'cp "../rust-fs-core/include/fs_core.h" "{{.OUT}}/include/fs_core.h"'
+
+  check:semver:
+    desc: Refuse a public-API break the version in Cargo.toml does not declare
+    # Against the newest version on crates.io, with cargo-semver-checks: a
+    # break needs the 0.x minor to move, an addition the patch. Why, and what
+    # it cannot see, is at the top of the script (#120). No `sources:` on
+    # purpose -- the baseline is the registry, which moves without this tree
+    # changing, so a fingerprint would call a stale answer up to date.
+    #
+    # Budget: measured 11 lines / 489 bytes on a passing run with the
+    # baseline's rustdoc cached, one line more when it is built (the first
+    # run, and every CI run). The lines are fixed, not per-item, so 40 /
+    # 4,000 leaves room for a warning block without masking a flood. A
+    # failing run prints every broken item and is not held to it.
+    cmds:
+      - '../rust-fs-core/scripts/tier.sh check:semver semver 40 4000 -- bash ../rust-fs-core/scripts/semver-check.sh'
+
+  lint:
+    desc: Formatting and clippy, exactly as CI runs them
+    # `--locked` is not decoration. It makes the build fail rather than
+    # silently update Cargo.lock, which is what keeps a local gate and
+    # CI checking the same dependency versions — and it is what the
+    # release process relies on.
+    #
+    # This exists so the CI gate can be reproduced locally. If the two
+    # ever differ, this is the copy that is wrong.
+    #
+    # `--all` is what reaches the local path dependencies: without it
+    # `tests/support` -- the crate every test reaches its oracles
+    # through -- is never checked (#367). Clippy has no such flag: it
+    # lints workspace members only, so `tests/support` is a member and
+    # `--workspace` selects it (#410). `tests/ci_profile.rs` holds both
+    # lines to it.
+    cmds:
+      - bash ../rust-fs-core/scripts/agents-core-check.sh
+      - bash ../rust-fs-core/scripts/changelog-check.sh
+      - bash ../rust-fs-core/scripts/features-check.sh
+      # The family scripts are rust-fs-core's alone: fails on a committed copy,
+      # or a call to a local copy.
+      - bash ../rust-fs-core/scripts/family-check.sh
+      - bash ../rust-fs-core/scripts/ci-gate.sh
+      - scripts/check-provenance.sh
+      - bash tests/scripts/test-no-whole-image-reads.sh
+      - cargo fmt --all --check
+      # `--features cli`: the command-line tools' target requires it, and
+      # clippy silently leaves out a target whose features are off.
+      - cargo clippy --locked --workspace --all-targets --features cli -- -D warnings
+
+  check:msrv:
+    desc: Build the library and binaries on the toolchain Cargo.toml's rust-version names
+    # The declared minimum is a claim a consumer acts on: an older compiler
+    # gets cargo's "requires rustc" refusal instead of trying. This is what
+    # keeps it true -- a newer std API used in library code turns it red
+    # here, not in someone else's build. The version is read out of
+    # Cargo.toml by the script, so there is one copy of it.
+    cmds: ['scripts/msrv.sh']
+
+  build:
+    desc: Debug build
+    cmds: ['cargo build']
+
+
+  clean:
+    desc: Remove this crate's cargo output
+    cmds: ['cargo clean']
+
+  artifact:
+    desc: Print the absolute path of the directory holding the built outputs
+    # `silent: true` is what makes this usable as a VALUE — without it chore
+    # echoes each command and a caller capturing stdout gets the echo too.
+    # PATTERNS.md: "a value — a flag string, a container status, a path" is a
+    # task called through {{.CHORE_EXE}}.
+    silent: true
+    # NO `deps: [staticlib]`. chore prints "task: staticlib is up to date" on
+    # STDOUT, which a caller capturing this as a value receives as PART OF THE
+    # VALUE — measured on rust-blk-probe, where the capture came back as two
+    # lines and the caller's path check failed. A value-returning task returns
+    # a value and does nothing else; the caller builds first, then asks. Two
+    # calls, on purpose.
+    #
+    # IT PRINTS A DIRECTORY, NOT A FILE, and that is the one place this differs
+    # from rust-blk-probe's `artifact`. That crate produces a single binary, so
+    # it can name a file. This one produces libfs_ext4.a AND the headers beside
+    # it, so there is no single path to name — A CONSUMER COPIES THE CONTENTS of
+    # what this prints. A consumer that treats it as a file path will silently
+    # copy the wrong thing.
+    cmds:
+      - 'cd "{{.OUT}}" && pwd -P'
+    vars:
+      OUT: 'dist'
+
+  check:provenance:
+    desc: No tracked file names Linux kernel or e2fsprogs internals
+    # A chore task naming a script, and nothing else, like check:ci-gate.
+    # The denylist, the allowlist of documented format names and the reason
+    # for each entry are in the script; AGENTS.md ("Clean room") has the
+    # rule it enforces. CI runs it as its own job, `provenance`, and `lint`
+    # runs it too, so a local `chore lint` reproduces that job.
+    cmds:
+      - scripts/check-provenance.sh
+
+  check:ci-gate:
+    desc: The one required check stands for every job in ci.yml
+    # A chore task naming a script, and nothing else. This was
+    # tests/ci_aggregate_gate.rs, which parsed a YAML file and compared
+    # strings, and as a cargo test counted towards the executed-test floor the
+    # gate itself enforces.
+    cmds:
+      - bash ../rust-fs-core/scripts/ci-gate.sh

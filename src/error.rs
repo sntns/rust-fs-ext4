@@ -2,7 +2,11 @@
 
 use std::io;
 
+/// `#[non_exhaustive]` (#120): a new way to fail is a new variant, and without
+/// this every variant added was a break for any caller matching exhaustively.
+/// A `match` outside this crate needs a `_` arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Underlying device I/O failure.
     Io(io::Error),
@@ -36,6 +40,9 @@ pub enum Error {
     /// Container (xattr in-inode region, xattr block, etc.) has no free
     /// space for the requested entry — POSIX ENOSPC.
     NoSpaceLeftOnDevice,
+    /// Requested file size exceeds the addressable blocks for its mapping
+    /// format (POSIX EFBIG).
+    FileTooLarge,
     /// Caller passed a malformed argument or attempted a semantically
     /// invalid mutation (POSIX EINVAL — e.g. truncate-grow, moving a dir
     /// into its own subtree, operating on a legacy non-EXTENTS inode).
@@ -52,6 +59,34 @@ pub enum Error {
     CorruptDirEntry(&'static str),
     /// Generic spec-violation error.
     Corrupt(&'static str),
+
+    /// The inode's link count has no room for another link (POSIX
+    /// EMLINK): a file at `MAX_LINKS` (65000) links, or a directory
+    /// with that many on a volume without `DIR_NLINK`.
+    TooManyLinks,
+
+    /// Path resolution followed more symbolic links than the Linux kernel
+    /// follows in one lookup (40, its `MAXSYMLINKS`): a loop, or a chain
+    /// too long to be anything else (POSIX ELOOP).
+    SymlinkLoop,
+
+    /// A structure this driver can read but cannot correctly modify.
+    /// Distinct from [`Error::ReadOnly`], which is about the mount, and
+    /// from the `Unsupported*` feature errors, which are about the volume:
+    /// this is one operation on one object being refused because doing it
+    /// would leave the filesystem worse than not doing it.
+    Unsupported(&'static str),
+
+    /// A write refused because the volume's journal holds committed
+    /// transactions this mount has not yet replayed onto the device: a
+    /// lazy mount before [`crate::fs::Filesystem::replay_journal_if_dirty`].
+    /// Writing first would commit over the unreplayed log and lose it.
+    /// Maps to EROFS: the mount is read-only until the replay runs.
+    JournalNotReplayed,
+    /// An inode handle no longer names the file it was taken from (POSIX
+    /// ESTALE): the inode number is out of range or reserved, the inode has
+    /// been freed, or it has been freed and reused under a new generation.
+    Stale,
 }
 
 impl From<io::Error> for Error {
@@ -82,6 +117,7 @@ impl std::fmt::Display for Error {
             Error::ReadOnly => write!(f, "read-only filesystem"),
             Error::NameTooLong => write!(f, "name too long"),
             Error::NoSpaceLeftOnDevice => write!(f, "no space left on device"),
+            Error::FileTooLarge => write!(f, "file too large"),
             Error::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Error::InvalidInode(n) => write!(f, "invalid inode number {n}"),
             Error::InvalidBlock(n) => write!(f, "invalid block number {n}"),
@@ -89,6 +125,13 @@ impl std::fmt::Display for Error {
             Error::CorruptExtentTree(msg) => write!(f, "corrupt extent tree: {msg}"),
             Error::CorruptDirEntry(msg) => write!(f, "corrupt directory entry: {msg}"),
             Error::Corrupt(msg) => write!(f, "corrupt: {msg}"),
+            Error::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            Error::JournalNotReplayed => {
+                write!(f, "read-only until the dirty journal is replayed")
+            }
+            Error::Stale => write!(f, "stale inode handle"),
+            Error::TooManyLinks => write!(f, "too many links"),
+            Error::SymlinkLoop => write!(f, "too many levels of symbolic links"),
         }
     }
 }
@@ -110,9 +153,12 @@ impl Error {
             Error::IsADirectory => EISDIR,
             Error::AlreadyExists => EEXIST,
             Error::DirectoryNotEmpty => ENOTEMPTY,
-            Error::ReadOnly => EROFS,
+            Error::ReadOnly | Error::JournalNotReplayed => EROFS,
             Error::NameTooLong => ENAMETOOLONG,
             Error::NoSpaceLeftOnDevice => ENOSPC,
+            Error::FileTooLarge => EFBIG,
+            Error::TooManyLinks => EMLINK,
+            Error::SymlinkLoop => ELOOP,
             Error::InvalidArgument(_) => EINVAL,
             Error::InvalidInode(_) | Error::InvalidBlock(_) | Error::OutOfBounds => EINVAL,
             Error::BadMagic { .. }
@@ -120,7 +166,10 @@ impl Error {
             | Error::CorruptExtentTree(_)
             | Error::CorruptDirEntry(_)
             | Error::Corrupt(_) => EIO,
-            Error::UnsupportedIncompat(_) | Error::UnsupportedRoCompat(_) => ENOTSUP,
+            Error::UnsupportedIncompat(_)
+            | Error::UnsupportedRoCompat(_)
+            | Error::Unsupported(_) => ENOTSUP,
+            Error::Stale => ESTALE,
         }
     }
 }
@@ -131,14 +180,19 @@ pub mod errno {
     pub const ENOENT: i32 = 2;
     pub const EIO: i32 = 5;
     pub const EEXIST: i32 = 17;
+    pub const EFBIG: i32 = 27;
     pub const ENOTDIR: i32 = 20;
     pub const EISDIR: i32 = 21;
     pub const EINVAL: i32 = 22;
     pub const EROFS: i32 = 30;
+    pub const EMLINK: i32 = 31;
+    pub const ERANGE: i32 = 34;
     pub const ENOSPC: i32 = 28;
+    pub const ELOOP: i32 = 62; // macOS POSIX value (Linux: 40)
     pub const ENAMETOOLONG: i32 = 63; // macOS POSIX value
     pub const ENOTSUP: i32 = 45;
     pub const ENOTEMPTY: i32 = 66; // macOS POSIX value
+    pub const ESTALE: i32 = 70; // macOS POSIX value (Linux: 116)
     pub const ENOSYS: i32 = 78; // macOS POSIX value (Linux: 38). Surfaced
                                 // by capi when a feature isn't implemented yet.
 }

@@ -6,14 +6,15 @@
 //!     written there (zero-padded to block_size), single extent inserted
 //!     into the inode's extent root.
 //!
-//! Linux's `ext4_symlink` uses the slow path when target length is >=
-//! sizeof(i_block) (i.e. >= 60). We match that boundary on both the write
-//! and read sides so a 60-byte target is consistently treated as slow.
+//! The format stores a target inline only when it is less than 60 bytes,
+//! the size of `i_block` (kernel.org format documentation, "Symbolic
+//! Links"), so a target of 60 bytes or more takes the slow path. We match
+//! that boundary on both the write and read sides so a 60-byte target is
+//! consistently treated as slow.
 
 use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::Write;
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -23,14 +24,11 @@ const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.im
 fn scratch(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dst = PathBuf::from(format!(
-        "/tmp/fs_ext4_capi_long_symlink_{tag}_{}_{n}.img",
+    let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
+        "fs_ext4_capi_long_symlink_{tag}_{}_{n}.img",
         std::process::id()
     ));
-    let bytes = fs::read(SRC).expect("read src");
-    let mut out = fs::File::create(&dst).expect("create");
-    out.write_all(&bytes).expect("write");
-    out.flush().expect("flush");
+    fs::copy(SRC, &dst).expect("copy src");
     dst
 }
 
@@ -74,8 +72,12 @@ fn readlink_to_bytes(fs_handle: *mut fs_ext4_fs_t, linkpath: &str, cap: usize) -
             buf.len(),
         )
     };
-    assert_eq!(rc, 0, "readlink {linkpath} failed: {}", last_err());
+    assert!(rc >= 0, "readlink {linkpath} failed: {}", last_err());
     let nul = buf.iter().position(|&b| b == 0).expect("NUL terminator");
+    assert_eq!(
+        rc as usize, nul,
+        "readlink {linkpath}: return is the target length"
+    );
     buf.truncate(nul);
     buf
 }
@@ -154,7 +156,7 @@ fn fast_path_59_byte_target_uses_inline_storage() {
 
 #[test]
 fn boundary_60_byte_target_takes_slow_path() {
-    // ext4 spec / Linux ext4_symlink: switch to slow when len >= sizeof(i_block).
+    // ext4 format documentation: switch to slow when len >= sizeof(i_block).
     // i_block is 60 bytes, so target.len() == 60 must use slow (one block
     // allocated, extent inserted). The read path checks `inode.size < 60`
     // for the fast branch; mismatched boundaries would corrupt readlink.

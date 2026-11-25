@@ -113,6 +113,18 @@ pub fn bit_is_set(bitmap: &[u8], idx: u32) -> bool {
 /// bitmaps (typical after mkfs) the scan is effectively memory-bandwidth
 /// bound and ~8–16× faster than per-bit `bit_is_set`.
 pub fn find_first_free(bitmap: &[u8], start: u32, max_bits: u32) -> Option<u32> {
+    // A BIT THAT IS NOT IN THE BITMAP IS NOT A FREE BIT.
+    //
+    // `bit_is_set` answers "not set" for an index past the end of the
+    // buffer, which reads as free, and `max_bits` comes from
+    // `s_blocks_per_group` / `s_inodes_per_group` -- superblock fields
+    // that nothing bounds to what a bitmap block can hold. So a group
+    // claiming 2^31 inodes per group returned bit indices that are not
+    // in its bitmap at all: the plan named a real inode or block, and
+    // the write that was supposed to mark it used silently did nothing
+    // while the counters were debited anyway. The next allocation then
+    // returned the same one.
+    let max_bits = max_bits.min(u32::try_from(bitmap.len().saturating_mul(8)).unwrap_or(u32::MAX));
     if start >= max_bits {
         return None;
     }
@@ -171,25 +183,32 @@ pub fn find_free_run(bitmap: &[u8], start: u32, max_bits: u32, count: u32) -> Op
     if count == 0 {
         return None;
     }
+    // THE RUN ENDS INSIDE THE BITMAP (#321). `bit_is_set` reports a bit
+    // past the end as free, so a `max_bits` beyond the bitmap -- a
+    // `blocks_per_group` over `8 * block_size` -- let a free tail run on
+    // into bits that do not exist, and the plan into the next group's
+    // blocks. `find_first_free` clamps the same way; the run's end must
+    // be judged against that clamp, not the raw value.
+    let max_bits = max_bits.min(u32::try_from(bitmap.len().saturating_mul(8)).unwrap_or(u32::MAX));
     let mut i = start;
-    while i + count <= max_bits {
+    while i.checked_add(count).is_some_and(|end| end <= max_bits) {
         // Vectorized: jump straight to the next free bit at-or-after `i`,
         // skipping all-ones words 64 bits at a time.
         let run_start = find_first_free(bitmap, i, max_bits)?;
-        if run_start + count > max_bits {
-            return None;
-        }
+        let run_end = run_start
+            .checked_add(count)
+            .filter(|&end| end <= max_bits)?;
         // Verify `count` contiguous free bits — bit-at-a-time, since the
         // blocker (if any) almost always sits within the first few bits.
         let mut j = run_start + 1;
-        while j < run_start + count && !bit_is_set(bitmap, j) {
+        while j < run_end && !bit_is_set(bitmap, j) {
             j += 1;
         }
-        if j - run_start >= count {
+        if j == run_end {
             return Some(run_start);
         }
         // Hit a used bit before reaching `count`; skip past it and retry.
-        i = j + 1;
+        i = j.checked_add(1)?;
     }
     None
 }
@@ -209,6 +228,117 @@ pub fn plan_block_allocation<F>(
     groups: &[BlockGroupDescriptor],
     count: u32,
     hint_group: u32,
+    bitmap_reader: F,
+) -> Result<BlockAllocationPlan>
+where
+    F: FnMut(u64) -> Result<Vec<u8>>,
+{
+    plan_block_allocation_excluding(sb, groups, count, hint_group, &[], bitmap_reader)
+}
+
+/// Set the bits of `reserved` that fall inside group `gi`.
+///
+/// The blocks are absolute; a group's bit `n` is block
+/// `gi * blocks_per_group + s_first_data_block + n`. Anything outside
+/// this group, or past the bits the group actually has, is skipped
+/// rather than wrapped -- a reservation in another group is not this
+/// group's business, and `blocks_in_group` is the ceiling the scan
+/// already honours.
+fn mark_reserved_in_group(
+    sb: &Superblock,
+    gi: u32,
+    max_bits: u32,
+    reserved: &[u64],
+    bitmap: &mut [u8],
+) {
+    if reserved.is_empty() {
+        return;
+    }
+    let group_first_block = (gi as u64) * (sb.blocks_per_group as u64) + sb.first_data_block as u64;
+    for &block in reserved {
+        let Some(offset) = block.checked_sub(group_first_block) else {
+            continue;
+        };
+        if offset >= max_bits as u64 {
+            continue;
+        }
+        let bit = offset as usize;
+        let byte = bit / 8;
+        if byte < bitmap.len() {
+            bitmap[byte] |= 1u8 << (bit % 8);
+        }
+    }
+}
+
+/// Every block a transaction has already spoken for: the data plan's
+/// whole run, plus the whole run of every meta plan handed out so far.
+///
+/// THE LIST IS A FUNCTION BECAUSE THE INLINE VERSION WAS UNWITNESSED.
+/// Three separate reverts of the inline code — dropping the data run,
+/// no-oping the meta push, and keeping only `first_block` instead of the
+/// whole `count` run — each left 278 library tests green and EXIT=0.
+/// At the time nothing in the suite reached `buffer_extend_dir_deep`,
+/// so the three lines that make the fix were held by nothing. Extracted
+/// here they are three assertions instead. Since 3973ce0 (#215),
+/// `tests/deep_dir_extent_nodes_are_distinct.rs` also drives a directory
+/// through the deep path and checks the result end to end, in the tier
+/// that runs e2fsck; these assertions remain the unit-tier witness.
+///
+/// A PLAN IS A RUN, NOT A BLOCK. `count` is 1 for every caller today,
+/// which is exactly why `first_block` alone passed every test that
+/// existed: the day a directory data page is planned as two contiguous
+/// blocks, a `first_block`-only reservation hands the second one out
+/// again as a tree node.
+pub(crate) fn reserved_blocks(
+    data: &BlockAllocationPlan,
+    handed_out: &[BlockAllocationPlan],
+) -> Vec<u64> {
+    std::iter::once(data)
+        .chain(handed_out)
+        .flat_map(|plan| (0..u64::from(plan.count)).map(move |i| plan.first_block + i))
+        .collect()
+}
+
+/// [`plan_block_allocation`], with blocks that are SPOKEN FOR BUT NOT YET
+/// COMMITTED treated as used.
+///
+/// # WHY THE PLANNER HAS TO BE TOLD, RATHER THAN ITS ANSWER FILTERED
+///
+/// A caller that plans several allocations before committing any of
+/// them -- which is the late-commit ordering the write paths use so a
+/// failure half way through leaks no blocks -- shows this function the
+/// same unchanged bitmap every time, so it returns the same block every
+/// time. Measured on a fresh 64 MiB image, three consecutive plans
+/// against an uncommitted bitmap: `517 517 517`.
+///
+/// The caller that hit this defended itself with one equality test
+/// against one reserved block, which is wrong twice: it refuses with
+/// `NoSpaceLeftOnDevice` on a nearly empty filesystem when the block
+/// does match, and when it does not it lets the SECOND meta block alias
+/// the first, because the test never looked at the ones it had already
+/// handed out. Two extent-tree nodes on one physical block is silent
+/// corruption; the refusal is at least loud.
+///
+/// EXTENDING THE EQUALITY TEST TO THE WHOLE LIST IS NOT THE FIX. The
+/// planner would go on returning the same block, so the list would just
+/// turn the aliasing into a second spurious refusal. The reservations
+/// have to be in the bitmap the scan reads.
+///
+/// # THE OVERLAY CANNOT LIVE IN THE CALLER'S READER
+///
+/// The obvious smaller change -- have the caller's `bitmap_reader`
+/// return bytes with the reserved bits already set -- is not enough,
+/// because a `BLOCK_UNINIT` group never calls the reader at all: the
+/// bitmap is fabricated as all-free right here. That is exactly the
+/// state a freshly formatted image is in, which is where this is most
+/// likely to bite. So the marking happens after the bitmap is obtained,
+/// on both paths.
+pub fn plan_block_allocation_excluding<F>(
+    sb: &Superblock,
+    groups: &[BlockGroupDescriptor],
+    count: u32,
+    hint_group: u32,
+    reserved: &[u64],
     mut bitmap_reader: F,
 ) -> Result<BlockAllocationPlan>
 where
@@ -234,18 +364,12 @@ where
         // may be short).
         let max_bits = blocks_in_group(sb, gi);
 
-        let bitmap_bytes: Vec<u8> = if bgd.flags().contains(BgdFlags::BLOCK_UNINIT) {
-            // Never read: all free, but for the superblock / GDT backups
-            // at the group's head, which the on-disk bitmap would mark.
-            let mut bm = vec![0u8; sb.block_size() as usize];
-            let overhead = sb.group_head_overhead(gi as u64).min(max_bits as u64);
-            for bit in 0..overhead as usize {
-                bm[bit / 8] |= 1 << (bit % 8);
-            }
-            bm
+        let mut bitmap_bytes: Vec<u8> = if bgd.flags().contains(BgdFlags::BLOCK_UNINIT) {
+            uninit_block_bitmap(sb, groups, gi)
         } else {
             bitmap_reader(bgd.block_bitmap)?
         };
+        mark_reserved_in_group(sb, gi, max_bits, reserved, &mut bitmap_bytes);
 
         let Some(bit_start) = find_free_run(&bitmap_bytes, 0, max_bits, count) else {
             continue;
@@ -282,14 +406,105 @@ where
     ))
 }
 
+// ---------------------------------------------------------------------------
+// The bitmap a BLOCK_UNINIT group stands for
+// ---------------------------------------------------------------------------
+//
+// A group flagged BLOCK_UNINIT has no block bitmap on disk worth reading
+// (blockgroup.html, "Lazy Block Group Initialization": the bitmap "can be
+// calculated"). bitmaps.html warns that uninitialised is not the same as
+// empty. What is in use is the group's fixed-location metadata:
+//
+// - at its head, when it carries a superblock copy or a META_BG descriptor
+//   copy, those blocks and (outside META_BG) the reserved GDT blocks --
+//   `Superblock::group_head_metadata_blocks`;
+// - its own block bitmap, inode bitmap and inode table, but only where the
+//   descriptor puts them inside this group. Under flex_bg they usually sit
+//   in another group, and blocks this group holds for *other* groups'
+//   bitmaps are not counted: `dumpe2fs` on a flex group leader forced to
+//   BLOCK_UNINIT lists them as free.
+//
+// Bits past the group's last block (a bitmap block has 8 * block_size of
+// them) are set, as every bitmap the tools write sets them; e2fsck
+// reports "Padding at end of block bitmap is not set" otherwise.
+//
+// tests in `needs_host` below compare this against `dumpe2fs` for every
+// BLOCK_UNINIT group of mkfs.ext4 volumes with and without flex_bg and
+// META_BG, at 1 KiB and 4 KiB.
+
+/// Group-relative block ranges that a `BLOCK_UNINIT` group has in use.
+pub(crate) fn uninit_group_used_ranges(
+    sb: &Superblock,
+    groups: &[BlockGroupDescriptor],
+    gi: usize,
+) -> Vec<std::ops::Range<u64>> {
+    let group_first = sb.first_data_block as u64 + gi as u64 * sb.blocks_per_group as u64;
+    let group_len = u64::from(blocks_in_group(sb, gi as u32));
+    let mut used = Vec::new();
+
+    let head = sb.group_head_metadata_blocks(gi as u64);
+    if head > 0 {
+        used.push(0..head.min(group_len));
+    }
+
+    if let Some(desc) = groups.get(gi) {
+        let table_len = (u64::from(sb.inodes_per_group) * u64::from(sb.inode_size))
+            .div_ceil(u64::from(sb.block_size()));
+        for (start, len) in [
+            (desc.block_bitmap, 1),
+            (desc.inode_bitmap, 1),
+            (desc.inode_table, table_len),
+        ] {
+            let Some(relative) = start.checked_sub(group_first) else {
+                continue;
+            };
+            if relative < group_len {
+                used.push(relative..(relative + len).min(group_len));
+            }
+        }
+    }
+    used
+}
+
+/// The whole block bitmap a `BLOCK_UNINIT` group stands for: the ranges
+/// of [`uninit_group_used_ranges`] and the padding past the group's end
+/// set, everything else clear. The planner and fsck read this instead of
+/// the unwritten bitmap block (#391), and the first allocation into the
+/// group writes it out.
+pub(crate) fn uninit_block_bitmap(
+    sb: &Superblock,
+    groups: &[BlockGroupDescriptor],
+    gi: u32,
+) -> Vec<u8> {
+    let mut bitmap = vec![0u8; sb.block_size() as usize];
+    let capacity = bitmap.len() as u64 * 8;
+    let padding = u64::from(blocks_in_group(sb, gi)).min(capacity)..capacity;
+    for range in uninit_group_used_ranges(sb, groups, gi as usize)
+        .into_iter()
+        .chain(std::iter::once(padding))
+    {
+        for bit in range.start.min(capacity)..range.end.min(capacity) {
+            bitmap[(bit / 8) as usize] |= 1 << (bit % 8);
+        }
+    }
+    bitmap
+}
+
 /// Returns the number of blocks that actually exist in group `gi` (the last
 /// group may be shorter than `blocks_per_group`).
-fn blocks_in_group(sb: &Superblock, gi: u32) -> u32 {
+pub(crate) fn blocks_in_group(sb: &Superblock, gi: u32) -> u32 {
     let ngroups = sb.block_group_count() as u32;
     if gi + 1 < ngroups {
         return sb.blocks_per_group;
     }
-    let remainder = (sb.blocks_count - sb.first_data_block as u64) % sb.blocks_per_group as u64;
+    // Saturating, though `Superblock::parse` now refuses a
+    // `s_first_data_block` at or past `blocks_count` (#181). Before that
+    // bound a larger value wrapped this subtraction, which made the last
+    // group's bit ceiling far larger than the group, so the allocator
+    // handed out blocks outside the filesystem. A `Superblock` built some
+    // other way than `parse` still gets the safe answer.
+    let remainder =
+        sb.blocks_count.saturating_sub(sb.first_data_block as u64) % sb.blocks_per_group as u64;
     if remainder == 0 {
         sb.blocks_per_group
     } else {
@@ -339,12 +554,41 @@ where
             bitmap_reader(bgd.inode_bitmap)?
         };
 
-        let Some(bit_start) = find_first_free(&bitmap_bytes, 0, max_bits) else {
+        // THE RESERVED INODES ARE NOT AVAILABLE.
+        //
+        // Inodes below `s_first_ino` are the filesystem's own: 2 is the
+        // root directory, 8 the journal. On a filesystem mke2fs wrote
+        // their bits are set, so scanning from zero skipped them by
+        // accident -- but the bitmap is bytes off the disk, and one
+        // with those bits clear (or a group 0 flagged INODE_UNINIT,
+        // which is read as an all-zero bitmap without being read at
+        // all) handed out inode 2. `apply_create` then writes the new
+        // file's inode image over the root directory's.
+        //
+        // The reserved range is inode NUMBERS, so it reaches past group 0
+        // whenever `s_first_ino` exceeds `inodes_per_group + 1`: with eight
+        // inodes a group, 9 and 10 are group 1's first bits (#327). The
+        // floor is the reserved range less the inodes before this group,
+        // in u64 because `gi * inodes_per_group` can pass u32.
+        let before_group = u64::from(gi) * u64::from(sb.inodes_per_group);
+        let floor = u64::from(sb.first_inode.saturating_sub(1)).saturating_sub(before_group);
+        let floor = u32::try_from(floor).unwrap_or(u32::MAX);
+        let Some(bit_start) = find_first_free(&bitmap_bytes, floor, max_bits) else {
             continue;
         };
 
         // Inode numbers are 1-based: first inode in group 0 is inode 1.
-        let inode = gi * sb.inodes_per_group + bit_start + 1;
+        // Checked, because `inodes_per_group` is a superblock field and
+        // the product wrapped in release -- a group-2 allocation came
+        // back as inode 2 and was written over the root inode while
+        // group 2's counters were debited.
+        let inode = u64::from(gi)
+            .checked_mul(u64::from(sb.inodes_per_group))
+            .and_then(|base| base.checked_add(u64::from(bit_start) + 1))
+            .filter(|n| *n <= u64::from(sb.inodes_count))
+            .ok_or(Error::Corrupt(
+                "the group's inode range does not fit in the filesystem",
+            ))? as u32;
 
         return Ok(InodeAllocationPlan {
             inode,
@@ -438,6 +682,95 @@ pub fn apply_bitmap_write(buf: &mut [u8], w: &BitmapWrite) {
 mod tests {
     use super::*;
 
+    // --- reserved_blocks -------------------------------------------
+    //
+    // THESE THREE ASSERTIONS ARE THE FIX. Before the extraction the
+    // same three decisions were inline in
+    // `Filesystem::buffer_extend_dir_deep`, and each could be
+    // reverted with 278 library tests green, EXIT=0, 0 compile errors:
+    // dropping the data run, no-oping the meta push, and reserving only
+    // `first_block` instead of the whole `count` run. Nothing in the
+    // suite reached that function then; since 3973ce0 (#215)
+    // `tests/deep_dir_extent_nodes_are_distinct.rs` does, in the e2fsck
+    // tier, and these stay as the unit-tier witness.
+
+    fn mk_plan(first_block: u64, count: u32) -> BlockAllocationPlan {
+        BlockAllocationPlan {
+            first_block,
+            count,
+            bitmap: BitmapWrite {
+                bitmap_block: 0,
+                bit_start: 0,
+                count,
+                set: true,
+            },
+            bgd: BgdCounterUpdate {
+                group_idx: 0,
+                free_blocks_delta: -(count as i32),
+                free_inodes_delta: 0,
+                used_dirs_delta: 0,
+            },
+            sb: SuperblockCounterUpdate {
+                free_blocks_delta: -(count as i64),
+                free_inodes_delta: 0,
+            },
+        }
+    }
+
+    /// THE DATA PAGE IS SPOKEN FOR. Nothing has reached the bitmap yet,
+    /// so a planner told nothing returns the data block again — and on
+    /// the first call it does exactly that, because that is the block it
+    /// returned for the data page moments earlier.
+    #[test]
+    fn the_data_plan_is_reserved() {
+        assert_eq!(reserved_blocks(&mk_plan(517, 1), &[]), vec![517]);
+    }
+
+    /// A PLAN IS A RUN, NOT A BLOCK. `count` is 1 for every caller
+    /// today, which is precisely why reserving `first_block` alone
+    /// passed every test that existed. The day a directory data page is
+    /// planned as two contiguous blocks, that version hands the second
+    /// one out again as a tree node.
+    #[test]
+    fn a_multi_block_plan_reserves_its_whole_run() {
+        assert_eq!(
+            reserved_blocks(&mk_plan(100, 3), &[]),
+            vec![100, 101, 102],
+            "reserving only first_block leaves 101 and 102 free to be handed out again"
+        );
+        assert_eq!(
+            reserved_blocks(&mk_plan(100, 1), &[mk_plan(200, 4)]),
+            vec![100, 200, 201, 202, 203],
+            "a handed-out meta plan contributes its whole run too"
+        );
+    }
+
+    /// THE SECOND CALL MUST SEE THE FIRST CALL'S ANSWER. Without this
+    /// the planner reads the same unchanged bitmap and returns the same
+    /// block, it passes into `pending_meta` a second time, and two
+    /// extent-tree nodes share one physical block — silent corruption,
+    /// which is the worse of the two consequences.
+    #[test]
+    fn every_meta_plan_handed_out_so_far_is_reserved() {
+        let data = mk_plan(517, 1);
+        let first = reserved_blocks(&data, &[]);
+        assert_eq!(first, vec![517]);
+
+        let handed_out = vec![mk_plan(518, 1)];
+        let second = reserved_blocks(&data, &handed_out);
+        assert!(
+            second.contains(&518),
+            "the block the first call was given must not be offered again: {second:?}"
+        );
+        assert!(
+            second.contains(&517),
+            "and the data block stays reserved across calls: {second:?}"
+        );
+
+        let handed_out = vec![mk_plan(518, 1), mk_plan(519, 1)];
+        assert_eq!(reserved_blocks(&data, &handed_out), vec![517, 518, 519]);
+    }
+
     fn mk_sb(
         block_size: u32,
         blocks_per_group: u32,
@@ -480,6 +813,101 @@ mod tests {
             inode_bitmap_csum: 0,
             checksum: 0,
         }
+    }
+
+    /// `bit_is_set` answers "not set" for an index past the end of the
+    /// buffer, which reads as free -- and `max_bits` comes from
+    /// `s_blocks_per_group` / `s_inodes_per_group`, superblock fields
+    /// that nothing bounds to what a bitmap block can hold.
+    ///
+    /// The plan then names a real inode or block while the write that
+    /// marks it used silently does nothing (the byte is past the
+    /// buffer), and the counters are debited anyway. The next
+    /// allocation returns the same one: every file on the same block,
+    /// every new inode over the last.
+    #[test]
+    fn a_bit_outside_the_bitmap_is_not_a_free_bit() {
+        // One byte of bitmap, every bit used, but a group claiming
+        // 2^31 bits.
+        let full = vec![0xFFu8];
+        assert_eq!(find_first_free(&full, 0, 1 << 31), None);
+        // And with room in the byte, only the bits that are there.
+        let partly = vec![0x0Fu8];
+        assert_eq!(find_first_free(&partly, 0, 1 << 31), Some(4));
+        assert_eq!(find_first_free(&partly, 8, 1 << 31), None);
+        // An empty bitmap has no free bits, however many are claimed.
+        assert_eq!(find_first_free(&[], 0, 1 << 31), None);
+    }
+
+    /// Inodes below `s_first_ino` are the filesystem's own: 2 is the
+    /// root directory, 8 the journal. On a filesystem mke2fs wrote,
+    /// their bits are set, so scanning from zero skipped them by
+    /// accident -- but the bitmap is bytes off the disk, and a group 0
+    /// flagged INODE_UNINIT is read as an all-zero bitmap without being
+    /// read at all.
+    #[test]
+    fn a_reserved_inode_is_never_allocated() {
+        let sb = mk_sb(1024, 8192, 128, 1024);
+        // Group 0 declared uninitialised, so its bitmap is taken as
+        // all-free without a device read.
+        let groups = vec![mk_bgd(100, 128, 0, BgdFlags::INODE_UNINIT.bits())];
+        assert_eq!(
+            sb.first_inode,
+            crate::superblock::GOOD_OLD_FIRST_INODE,
+            "the fixture superblock leaves s_first_ino zero; the floor comes from the parser"
+        );
+        let plan = plan_inode_allocation(&sb, &groups, false, 0, |_| {
+            panic!("an uninitialised group is not read")
+        })
+        .expect("a group with free inodes");
+        assert!(
+            plan.inode >= sb.first_inode,
+            "allocated inode {} , where the first non-reserved one is {} -- \
+             writing it puts the new file's inode over the root directory's",
+            plan.inode,
+            sb.first_inode
+        );
+
+        // Group 1 has no reserved inodes, so it starts at its first bit.
+        let groups = vec![
+            mk_bgd(100, 0, 0, 0),
+            mk_bgd(100, 128, 0, BgdFlags::INODE_UNINIT.bits()),
+        ];
+        let plan = plan_inode_allocation(&sb, &groups, false, 1, |_| unreachable!()).unwrap();
+        assert_eq!(plan.inode, 128 + 1);
+    }
+
+    /// The reserved range is inode numbers, not group 0's bits: with
+    /// eight inodes a group and `s_first_ino` 11, group 0 is all reserved
+    /// and group 1's first two (9 and 10) are too. The floor applied to
+    /// group 0 only, so group 1 handed out inode 9 (#327).
+    #[test]
+    fn the_reserved_range_reaches_past_group_0() {
+        let sb = mk_sb(1024, 8192, 8, 1024);
+        assert_eq!((sb.inodes_per_group, sb.first_inode), (8, 11));
+        let groups = vec![
+            mk_bgd(100, 0, 0, 0),
+            mk_bgd(100, 8, 0, BgdFlags::INODE_UNINIT.bits()),
+        ];
+        let plan = plan_inode_allocation(&sb, &groups, false, 0, |_| {
+            panic!("group 0 is full and group 1 uninitialised: nothing is read")
+        })
+        .expect("group 1 has free inodes");
+        assert_eq!(
+            plan.inode, 11,
+            "inodes 9 and 10 are below s_first_ino, in group 1"
+        );
+        assert_eq!((plan.bgd.group_idx, plan.bitmap.bit_start), (1, 2));
+
+        // A group wholly below s_first_ino has nothing to give.
+        let groups = vec![
+            mk_bgd(100, 0, 0, 0),
+            mk_bgd(100, 8, 0, BgdFlags::INODE_UNINIT.bits()),
+        ];
+        let mut sb = sb;
+        sb.first_inode = 17;
+        let plan = plan_inode_allocation(&sb, &groups, false, 1, |_| unreachable!());
+        assert!(plan.is_err(), "inodes 9..=16 are all reserved: {plan:?}");
     }
 
     #[test]
@@ -563,6 +991,19 @@ mod tests {
         assert_eq!(find_free_run(&buf, 0, 8, 2), None);
     }
 
+    /// A run is never found past the end of the bitmap (#321).
+    /// `bit_is_set` reports a bit past the end as free, so a `max_bits`
+    /// larger than the bitmap -- a `blocks_per_group` over
+    /// `8 * block_size` -- let a free tail extend into bits that do not
+    /// exist, and the plan's blocks into the next group's.
+    #[test]
+    fn find_free_run_stops_at_the_end_of_the_bitmap() {
+        assert_eq!(find_free_run(&[0], 0, 100, 9), None);
+        assert_eq!(find_free_run(&[0], 0, 100, 8), Some(0));
+        assert_eq!(find_free_run(&[0x0F], 0, u32::MAX, 5), None);
+        assert_eq!(find_free_run(&[0], u32::MAX - 1, u32::MAX, 4), None);
+    }
+
     #[test]
     fn block_allocation_uses_first_group_with_room() {
         let sb = mk_sb(4096, 32768, 8192, 65536);
@@ -591,6 +1032,157 @@ mod tests {
         assert_eq!(plan.first_block, 1 + 32768);
     }
 
+    /// THE DEFECT, AND ITS CONTROL IN THE SAME TEST.
+    ///
+    /// A caller that plans several allocations before committing any of
+    /// them shows the planner the same bitmap every time. Without
+    /// reservations the planner is right to return the same block every
+    /// time -- the bitmap says it is free -- which is why the fix is to
+    /// tell it, not to filter its answer.
+    #[test]
+    fn consecutive_plans_repeat_without_reservations_and_advance_with_them() {
+        let sb = mk_sb(4096, 32768, 8192, 65536);
+        let groups = vec![mk_bgd(32768, 8000, 0, 0)];
+        let read = |_b| Ok(vec![0u8; 4096]);
+
+        // The uncommitted bitmap, three times over: identical answers.
+        let unreserved: Vec<u64> = (0..3)
+            .map(|_| {
+                plan_block_allocation(&sb, &groups, 1, 0, read)
+                    .unwrap()
+                    .first_block
+            })
+            .collect();
+        assert_eq!(
+            unreserved,
+            vec![1, 1, 1],
+            "nothing was committed, so the scan sees the same bytes each time"
+        );
+
+        // The same three, each told what the previous ones took.
+        let mut reserved: Vec<u64> = Vec::new();
+        let mut handed_out: Vec<u64> = Vec::new();
+        for _ in 0..3 {
+            let plan =
+                plan_block_allocation_excluding(&sb, &groups, 1, 0, &reserved, read).unwrap();
+            reserved.push(plan.first_block);
+            handed_out.push(plan.first_block);
+        }
+        assert_eq!(
+            handed_out,
+            vec![1, 2, 3],
+            "each plan must avoid the blocks the ones before it took"
+        );
+    }
+
+    /// A MULTI-BLOCK RESERVATION IS RESERVED WHOLE.
+    ///
+    /// `count` is not always 1: the data-page plan this was written for
+    /// can cover a run, and reserving only its first block would let the
+    /// next plan land inside it.
+    #[test]
+    fn a_reserved_run_is_skipped_entirely() {
+        let sb = mk_sb(4096, 32768, 8192, 65536);
+        let groups = vec![mk_bgd(32768, 8000, 0, 0)];
+        let read = |_b| Ok(vec![0u8; 4096]);
+        let reserved: Vec<u64> = (1..=4).collect();
+        let plan = plan_block_allocation_excluding(&sb, &groups, 1, 0, &reserved, read).unwrap();
+        assert_eq!(plan.first_block, 5, "blocks 1..=4 are spoken for");
+    }
+
+    /// THE CASE AN OVERLAY IN THE CALLER'S READER CANNOT REACH.
+    ///
+    /// A `BLOCK_UNINIT` group never calls the bitmap reader -- the
+    /// bitmap is fabricated as all-free -- so a caller that set the bits
+    /// on the bytes it returns would have no effect here at all. That is
+    /// the state a freshly formatted image is in.
+    #[test]
+    fn a_reservation_is_honoured_in_an_uninit_group() {
+        let sb = mk_sb(4096, 32768, 8192, 65536);
+        let groups = vec![mk_bgd(32768, 8000, 0, BgdFlags::BLOCK_UNINIT.bits())];
+        let mut call_count = 0;
+        let read = |_b| {
+            call_count += 1;
+            Ok(vec![0u8; 4096])
+        };
+        // Group 0's superblock and one GDT block are blocks 1 and 2, so 3
+        // is the first block the implied bitmap leaves free.
+        let plan = plan_block_allocation_excluding(&sb, &groups, 1, 0, &[3], read).unwrap();
+        assert_eq!(plan.first_block, 4, "block 3 is reserved");
+        assert_eq!(call_count, 0, "an UNINIT group still reads no bitmap");
+    }
+
+    /// An uninit group is not an empty one. Its backup superblock, GDT and
+    /// reserved GDT blocks, and the bitmaps and inode table the descriptor
+    /// places inside it, are all in use in the bitmap the flag implies.
+    /// Planning against all zeroes handed the backup superblock out first.
+    #[test]
+    fn an_uninit_group_keeps_its_own_metadata() {
+        let mut sb = mk_sb(4096, 32768, 8192, 65536);
+        sb.reserved_gdt_blocks = 3;
+        let g0 = mk_bgd(0, 8000, 0, 0);
+        let mut g1 = mk_bgd(32768, 8000, 0, BgdFlags::BLOCK_UNINIT.bits());
+        // Group 1 starts at block 32769. Superblock, one GDT block and three
+        // reserved blocks take 32769..=32773; put the bitmaps right after and
+        // the inode table (8192 * 256 / 4096 = 512 blocks) after those.
+        g1.block_bitmap = 32774;
+        g1.inode_bitmap = 32775;
+        g1.inode_table = 32776;
+        let groups = vec![g0, g1];
+        let read = |_b| Ok(vec![0u8; 4096]);
+        let plan = plan_block_allocation(&sb, &groups, 1, 1, read).unwrap();
+        assert_eq!(
+            plan.first_block,
+            32776 + 512,
+            "first block past the group's metadata"
+        );
+
+        // The ranges themselves, relative to the group start.
+        let used = uninit_group_used_ranges(&sb, &groups, 1);
+        assert_eq!(used, vec![0..5, 5..6, 6..7, 7..519]);
+    }
+
+    /// THE ACCEPTANCE HALF: a reservation is a reservation of one block
+    /// in one group, not a blanket refusal.
+    ///
+    /// A reservation belonging to another group, or past the bits the
+    /// group actually has, must not narrow this group's scan -- an
+    /// over-eager mask would refuse allocations on a filesystem with
+    /// room, which is the failure the old equality test already had.
+    #[test]
+    fn a_reservation_outside_this_group_does_not_narrow_it() {
+        let sb = mk_sb(4096, 32768, 8192, 65536);
+        let groups = vec![mk_bgd(32768, 8000, 0, 0), mk_bgd(32768, 8000, 0, 0)];
+        let read = |_b| Ok(vec![0u8; 4096]);
+        // Group 1's first block, and a block past the end of the volume.
+        let reserved = [1 + 32768, 999_999];
+        let plan = plan_block_allocation_excluding(&sb, &groups, 1, 0, &reserved, read).unwrap();
+        assert_eq!(
+            plan.first_block, 1,
+            "neither reservation is in group 0, so group 0 is untouched"
+        );
+        // And the one that IS in group 1 still applies there.
+        let full_g0 = vec![mk_bgd(0, 8000, 0, 0), mk_bgd(32768, 8000, 0, 0)];
+        let plan = plan_block_allocation_excluding(&sb, &full_g0, 1, 0, &reserved, read).unwrap();
+        assert_eq!(
+            plan.first_block,
+            2 + 32768,
+            "group 0 has no room, and group 1's first block is reserved"
+        );
+    }
+
+    /// `plan_block_allocation` is `plan_block_allocation_excluding` with
+    /// nothing reserved, and must stay exactly that.
+    #[test]
+    fn the_unreserved_wrapper_agrees_with_the_general_form() {
+        let sb = mk_sb(4096, 32768, 8192, 65536);
+        let groups = vec![mk_bgd(5, 8000, 0, 0), mk_bgd(20000, 8000, 0, 0)];
+        let read = |_b| Ok(vec![0u8; 4096]);
+        let a = plan_block_allocation(&sb, &groups, 10, 0, read).unwrap();
+        let b = plan_block_allocation_excluding(&sb, &groups, 10, 0, &[], read).unwrap();
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn block_allocation_honours_block_uninit_flag() {
         let sb = mk_sb(4096, 32768, 8192, 65536);
@@ -607,6 +1199,14 @@ mod tests {
         assert_eq!(call_count, 0, "UNINIT group should not read bitmap");
     }
 
+    /// Inode numbers are one-based, and group 0's first *available*
+    /// one is `s_first_ino`.
+    ///
+    /// This used to assert inode 1, on an all-free bitmap that no real
+    /// filesystem has: mke2fs sets the reserved bits, so scanning from
+    /// zero returned 11 anyway and the assertion only held for the
+    /// synthetic bitmap here. It is the reserved range the allocator
+    /// must not enter, not the bits that happen to be set.
     #[test]
     fn inode_allocation_returns_one_based_number() {
         let sb = mk_sb(4096, 32768, 8192, 65536);
@@ -614,7 +1214,11 @@ mod tests {
         let groups = vec![g0];
         let read = |_b| Ok(vec![0u8; 4096]);
         let plan = plan_inode_allocation(&sb, &groups, false, 0, read).unwrap();
-        assert_eq!(plan.inode, 1, "first inode in group 0 is ino 1");
+        assert_eq!(
+            plan.inode, sb.first_inode,
+            "group 0's first available inode is s_first_ino, not inode 1"
+        );
+        assert_eq!(plan.bitmap.bit_start, sb.first_inode - 1, "one-based");
         assert!(!plan.is_dir);
         assert_eq!(plan.bgd.used_dirs_delta, 0);
     }
@@ -692,5 +1296,189 @@ mod tests {
         let sb = mk_sb(4096, 32768, 8192, 32769 + 100);
         assert_eq!(blocks_in_group(&sb, 0), 32768); // full
         assert_eq!(blocks_in_group(&sb, 1), 100); // short last group
+    }
+}
+
+/// [`uninit_block_bitmap`] against `dumpe2fs`, which lists every group's
+/// free blocks, BLOCK_UNINIT ones included, from its own reconstruction.
+#[cfg(test)]
+mod uninit_bitmap_oracle {
+    mod needs_host {
+        use crate::alloc::{blocks_in_group, uninit_block_bitmap};
+        use crate::bgd::BgdFlags;
+        use crate::block_io::FileDevice;
+        use crate::fs::Filesystem;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        /// Group number -> its "Free blocks:" list, as absolute ranges.
+        fn dumpe2fs_free(image: &str) -> BTreeMap<usize, Vec<(u64, u64)>> {
+            let out = fs_ext4_test_support::oracle("dumpe2fs")
+                .arg(image)
+                .judged()
+                .clean("dumpe2fs");
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let mut free = BTreeMap::new();
+            let mut group = None;
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("Group ") {
+                    group = rest.split(':').next().and_then(|g| g.parse().ok());
+                } else if let (Some(g), Some(list)) =
+                    (group, line.trim().strip_prefix("Free blocks:"))
+                {
+                    let ranges = list
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|r| !r.is_empty())
+                        .map(|r| match r.split_once('-') {
+                            Some((a, b)) => (a.parse().unwrap(), b.parse().unwrap()),
+                            None => (r.parse().unwrap(), r.parse().unwrap()),
+                        })
+                        .collect();
+                    free.insert(g, ranges);
+                }
+            }
+            free
+        }
+
+        fn check(
+            tag: &str,
+            block_size: u32,
+            blocks_per_group: u32,
+            kib: u64,
+            features: &str,
+            force_last_group: bool,
+        ) {
+            let image =
+                fs_ext4_test_support::temp_path!("fs_ext4_uninit_{tag}_{}.img", std::process::id());
+            std::fs::File::create(&image)
+                .and_then(|f| f.set_len(kib << 10))
+                .unwrap();
+            let mut mkfs = fs_ext4_test_support::oracle("mkfs.ext4").args([
+                "-q",
+                "-F",
+                "-b",
+                &block_size.to_string(),
+                "-g",
+                &blocks_per_group.to_string(),
+            ]);
+            if !features.is_empty() {
+                mkfs = mkfs.args(["-O", features]);
+            }
+            let out = mkfs.arg(&image).output();
+            assert!(
+                out.status.success(),
+                "[{tag}] {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+
+            if force_last_group {
+                // mkfs.ext4 never leaves the last group BLOCK_UNINIT, so the
+                // short group's padding is exercised by setting the flag
+                // with debugfs, as a resize could leave it. (dumpe2fs then
+                // lists the group as if it were full length, free blocks
+                // past the end of the volume included; only the blocks
+                // that exist are compared.)
+                let last = {
+                    let fs =
+                        Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
+                    let last = fs.groups.len() - 1;
+                    (last, fs.groups[last].flags | BgdFlags::BLOCK_UNINIT.bits())
+                };
+                let script = format!(
+                    "set_bg {0} flags {1}\nset_bg {0} checksum calc\n",
+                    last.0, last.1
+                );
+                let out = fs_ext4_test_support::oracle("debugfs")
+                    .args(["-w", "-f", "-", &image])
+                    .stdin(script)
+                    .output();
+                assert!(out.status.success(), "[{tag}] debugfs set_bg");
+            }
+            let free = dumpe2fs_free(&image);
+            let fs = Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
+            let bpg = u64::from(fs.sb.blocks_per_group);
+            let mut checked = 0;
+            for (gi, desc) in fs.groups.iter().enumerate() {
+                if !desc.flags().contains(BgdFlags::BLOCK_UNINIT) {
+                    continue;
+                }
+                checked += 1;
+                let first = u64::from(fs.sb.first_data_block) + gi as u64 * bpg;
+                let len = u64::from(blocks_in_group(&fs.sb, gi as u32));
+                let bitmap = uninit_block_bitmap(&fs.sb, &fs.groups, gi as u32);
+                let is_free = |block: u64| free[&gi].iter().any(|&(a, b)| (a..=b).contains(&block));
+                for bit in 0..bitmap.len() as u64 * 8 {
+                    let set = bitmap[(bit / 8) as usize] & (1 << (bit % 8)) != 0;
+                    if bit >= len {
+                        assert!(set, "[{tag}] group {gi}: padding bit {bit} is clear");
+                    } else {
+                        assert_eq!(
+                            !set,
+                            is_free(first + bit),
+                            "[{tag}] group {gi}, block {}",
+                            first + bit
+                        );
+                    }
+                }
+                assert_eq!(
+                    free[&gi]
+                        .iter()
+                        .filter(|&&(a, _)| a < first + len)
+                        .map(|&(a, b)| b.min(first + len - 1) - a + 1)
+                        .sum::<u64>(),
+                    u64::from(desc.free_blocks_count),
+                    "[{tag}] group {gi}: dumpe2fs's list and the descriptor"
+                );
+            }
+            assert!(checked >= 3, "[{tag}] only {checked} BLOCK_UNINIT groups");
+            drop(fs);
+            let _ = std::fs::remove_file(&image);
+        }
+
+        #[test]
+        fn a_1k_flex_bg_volume() {
+            check("1k_flex", 1024, 1024, 64 << 10, "", false);
+        }
+
+        #[test]
+        fn a_1k_volume_without_flex_bg() {
+            check("1k_noflex", 1024, 1024, 64 << 10, "^flex_bg", false);
+        }
+
+        #[test]
+        fn a_4k_flex_bg_volume() {
+            check("4k_flex", 4096, 2048, 256 << 10, "", false);
+        }
+
+        #[test]
+        fn a_4k_volume_without_flex_bg() {
+            check(
+                "4k_noflex",
+                4096,
+                2048,
+                256 << 10,
+                "^flex_bg,^resize_inode",
+                false,
+            );
+        }
+
+        #[test]
+        fn a_1k_meta_bg_volume_without_flex_bg() {
+            check(
+                "1k_meta",
+                1024,
+                1024,
+                64 << 10,
+                "meta_bg,^resize_inode,^flex_bg",
+                false,
+            );
+        }
+
+        #[test]
+        fn a_short_last_group() {
+            // 64 MiB + 300 KiB: the last group has 300 blocks.
+            check("1k_short", 1024, 1024, (64 << 10) + 300, "^flex_bg", true);
+        }
     }
 }

@@ -13,20 +13,24 @@
 use fs_ext4::block_io::BlockDevice;
 use fs_ext4::error::Result;
 use fs_ext4::Filesystem;
-use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 struct CountingFile {
-    bytes: Mutex<Vec<u8>>,
+    file: Mutex<File>,
+    size: u64,
     reads: AtomicU64,
 }
 
 impl CountingFile {
     fn from_file(path: &str) -> Arc<Self> {
-        let bytes = fs::read(path).expect("read image");
+        let file = File::open(path).expect("open image");
+        let size = file.metadata().expect("image metadata").len();
         Arc::new(Self {
-            bytes: Mutex::new(bytes),
+            file: Mutex::new(file),
+            size,
             reads: AtomicU64::new(0),
         })
     }
@@ -39,24 +43,25 @@ impl CountingFile {
 impl BlockDevice for CountingFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        let b = self.bytes.lock().unwrap();
-        let off = offset as usize;
-        if off + buf.len() > b.len() {
+        if offset.saturating_add(buf.len() as u64) > self.size {
             return Err(fs_ext4::error::Error::OutOfBounds);
         }
-        buf.copy_from_slice(&b[off..off + buf.len()]);
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)?;
         Ok(())
     }
     fn size_bytes(&self) -> u64 {
-        self.bytes.lock().unwrap().len() as u64
+        self.size
     }
     fn is_writable(&self) -> bool {
         false
     }
 }
 
+#[track_caller]
 fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name)
 }
 
 fn workload(fs: &Filesystem) {
@@ -70,9 +75,6 @@ fn workload(fs: &Filesystem) {
 #[test]
 fn repeated_lookups_hit_cache_not_inner_device() {
     let path = image_path("ext4-basic.img");
-    if !std::path::Path::new(&path).exists() {
-        return;
-    }
 
     let inner = CountingFile::from_file(&path);
     let fs = Filesystem::mount(inner.clone()).expect("mount");

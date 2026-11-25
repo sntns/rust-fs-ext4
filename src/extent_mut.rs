@@ -57,6 +57,9 @@ pub(crate) fn split_phys_block(block: u64) -> (u16, u32) {
 pub enum ExtentMutation {
     /// Overwrite the inline root (60 bytes of `i_block`) with these bytes.
     WriteRoot { bytes: Vec<u8> },
+    /// Rewrite an existing external extent node. The filesystem patches its
+    /// checksum and journals this together with the inode and bitmap updates.
+    WriteTreeBlock { block: u64, bytes: Vec<u8> },
     /// Allocate a fresh leaf block and write these bytes to it. Returned for
     /// future multi-level operations; not produced by the current plan fns.
     AllocLeafBlock { bytes: Vec<u8> },
@@ -126,10 +129,31 @@ fn read_leaf_entries(root: &[u8]) -> Result<(ExtentHeader, Vec<Extent>)> {
     Ok((header, out))
 }
 
-/// Returns true iff two adjacent leaf extents are physically contiguous and
-/// in the same uninit state — candidate for a merge.
+/// Longest extent `ee_len` can describe in `uninitialized` state: 32768
+/// initialized blocks, 32767 uninitialized (an `ee_len` above 32768 is what
+/// marks an extent uninitialized, so 32768 itself is reserved for the
+/// initialized one). These are the two maxima the format documentation
+/// gives with `ee_len`, and a merge never crosses them.
+fn max_extent_len(uninitialized: bool) -> u32 {
+    if uninitialized {
+        u32::from(EXT_INIT_MAX_LEN) - 1
+    } else {
+        u32::from(EXT_INIT_MAX_LEN)
+    }
+}
+
+/// Returns true iff two adjacent leaf extents are physically contiguous, in
+/// the same uninit state, and short enough together to be one extent —
+/// candidate for a merge.
+///
+/// The length cap is not optional (#387): an initialized extent longer than
+/// 32768 blocks encodes as an uninitialized one of `len - 32768`, and two
+/// uninitialized ones past 32767 overflow `ee_len`.
 fn are_contiguous(a: &Extent, b: &Extent) -> bool {
     if a.uninitialized != b.uninitialized {
+        return false;
+    }
+    if u32::from(a.length) + u32::from(b.length) > max_extent_len(a.uninitialized) {
         return false;
     }
     let a_log_end = a.logical_block as u64 + a.length as u64;
@@ -357,18 +381,21 @@ pub struct DeepInsertPlan {
     pub allocated_blocks: Vec<u64>,
 }
 
-/// One frame on the descent path: the block we read, its raw bytes, and the
-/// index entry inside its parent that pointed at it. The root frame uses
-/// `block = 0` and `idx_in_parent = 0` purely as placeholders — root is
-/// recognized by its position (the first frame) rather than by these fields.
+/// One frame on the descent path: the block we read and its raw bytes.
+///
+/// The root frame uses `block = 0` as a placeholder — root is recognised
+/// by its position (the first frame) rather than by the field.
+///
+/// It also carried `idx_in_parent`, the position of the index entry in
+/// the parent that selected this child. Every construction site set it
+/// and nothing ever read it; the crate-wide `allow(dead_code)` is what
+/// kept that invisible. If a rebalance ever needs to rewrite a parent's
+/// entry in place, it comes back — as a field something reads.
 struct PathFrame {
     /// Block number of this node. `0` if this is the inline root.
     block: u64,
     /// Raw bytes (60 for root, `block_size` for everything below).
     bytes: Vec<u8>,
-    /// Position of the index entry inside the parent that selected this
-    /// child. `0` for the root frame (no parent).
-    idx_in_parent: usize,
 }
 
 /// Encode a 12-byte index entry pointing at `child_phys` for the subtree
@@ -492,6 +519,109 @@ fn build_inline_leaf_root(generation: u32, extents: &[Extent]) -> Vec<u8> {
     build_root(&header, extents, 60)
 }
 
+/// An extent tree laid out again over blocks the file already owns.
+pub struct RepackedTree {
+    /// The 60 bytes for the inode's `i_block`.
+    pub new_root: Vec<u8>,
+    /// Blocks to write, and what to write into them. The tail checksum is
+    /// the caller's, as everywhere else here.
+    pub block_writes: Vec<(u64, Vec<u8>)>,
+    /// The blocks from `nodes` that the layout used, in the order it used
+    /// them. Everything else in `nodes` is now unreferenced.
+    pub used_nodes: Vec<u64>,
+    /// Blocks `alloc` handed out, when the file's own were not enough. The
+    /// caller accounts for them as it does for any allocation.
+    pub allocated_blocks: Vec<u64>,
+}
+
+/// Lay `entries` out again as a tree over `nodes`, packing every node full.
+///
+/// This is what a punch needs. The survivors of a punch are a subset of the
+/// entries the tree already held, so packing them takes no more nodes than
+/// the tree already has, and the blocks it does not use go back to free
+/// space. Nothing is allocated: a punch frees, and an allocation inside it
+/// would be a second thing that can fail.
+///
+/// Four or fewer entries need no nodes at all — they go in the inode, which
+/// is the case the punch path handled before (#258).
+///
+/// `alloc` covers the case where they are not enough. A punch inside one
+/// extent leaves a head and a tail where there was one record, so the
+/// survivors can outnumber the entries by one — and since this packs every
+/// node full, a tree it laid out before has no spare room for that one. It is
+/// called only then, and only for as many blocks as the layout is short.
+///
+/// # Errors
+///
+/// Whatever `alloc` returns when the layout needs a block the file does not
+/// already hold.
+pub fn plan_repack_tree(
+    generation: u32,
+    entries: &[Extent],
+    block_size: u32,
+    nodes: &[u64],
+    alloc: &mut dyn FnMut() -> Result<u64>,
+) -> Result<RepackedTree> {
+    let bs = block_size as usize;
+    let mut used_nodes: Vec<u64> = Vec::new();
+    let mut allocated_blocks: Vec<u64> = Vec::new();
+    let mut block_writes: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    if entries.len() <= 4 {
+        return Ok(RepackedTree {
+            new_root: build_inline_leaf_root(generation, entries),
+            block_writes,
+            used_nodes,
+            allocated_blocks,
+        });
+    }
+
+    let mut supply = nodes.iter().copied();
+    let mut take = |used: &mut Vec<u64>, fresh: &mut Vec<u64>| -> Result<u64> {
+        match supply.next() {
+            Some(block) => {
+                used.push(block);
+                Ok(block)
+            }
+            None => {
+                let block = alloc()?;
+                fresh.push(block);
+                Ok(block)
+            }
+        }
+    };
+
+    let cap = node_max_entries(bs) as usize;
+
+    // The leaves, each packed full, and the index entries naming them.
+    let mut indices: Vec<(u32, u64)> = Vec::new();
+    for chunk in entries.chunks(cap) {
+        let block = take(&mut used_nodes, &mut allocated_blocks)?;
+        block_writes.push((block, build_full_leaf_block(generation, chunk, bs)));
+        indices.push((chunk[0].logical_block, block));
+    }
+
+    // Index levels, until what is left fits the inode's four entries.
+    let mut depth = 1u16;
+    while indices.len() > 4 {
+        let mut above: Vec<(u32, u64)> = Vec::new();
+        for chunk in indices.chunks(cap) {
+            let block = take(&mut used_nodes, &mut allocated_blocks)?;
+            block_writes.push((block, build_full_index_block(generation, depth, chunk, bs)));
+            above.push((chunk[0].0, block));
+        }
+        indices = above;
+        depth += 1;
+    }
+
+    Ok(RepackedTree {
+        new_root: build_inline_index_root(generation, depth, &indices),
+        block_writes,
+        used_nodes,
+        allocated_blocks,
+    })
+}
+
 /// Reject any insert whose logical range overlaps an existing leaf entry.
 fn check_no_overlap(entries: &[Extent], new: &Extent) -> Result<()> {
     let n_start = new.logical_block as u64;
@@ -573,7 +703,6 @@ fn descend_to_leaf(
     path.push(PathFrame {
         block: 0,
         bytes: root_bytes.to_vec(),
-        idx_in_parent: 0,
     });
 
     loop {
@@ -589,33 +718,24 @@ fn descend_to_leaf(
         }
         // Find largest index entry whose ei_block <= target_logical (mirrors
         // the read-side descent in extent::lookup_verified).
-        let mut chosen_pos: usize = 0;
-        let mut chosen_idx: Option<ExtentIdx> = None;
-        for i in 0..header.entries {
-            let off = extent_entry_offset(i as usize);
-            let idx = ExtentIdx::parse(&frame.bytes[off..off + EXT4_EXT_NODE_SIZE])?;
-            if idx.logical_block <= target_logical {
-                chosen_pos = i as usize;
-                chosen_idx = Some(idx);
-            } else {
-                break;
-            }
-        }
+        //
+        // `ExtentHeader::parse` bounds `entries` by `max` but nothing bounds
+        // `max` by the node, so every entry is range-checked here: a root
+        // claiming five index entries in its four-entry area, or a child
+        // block claiming more than the block holds, is corrupt (#327).
+        let entries = parse_index_entries(&frame.bytes, &header)?;
+        let chosen_idx = entries
+            .iter()
+            .take_while(|idx| idx.logical_block <= target_logical)
+            .last();
         // If target is below the smallest index entry, descend into the
         // first child (the new extent will sort into the leftmost subtree).
-        let idx = match chosen_idx {
-            Some(i) => i,
-            None => {
-                let off = extent_entry_offset(0);
-                ExtentIdx::parse(&frame.bytes[off..off + EXT4_EXT_NODE_SIZE])?
-            }
-        };
+        let idx = *chosen_idx.unwrap_or(&entries[0]);
         let mut child_buf = vec![0u8; block_size as usize];
         reader.read_block(idx.leaf_block, &mut child_buf)?;
         path.push(PathFrame {
             block: idx.leaf_block,
             bytes: child_buf,
-            idx_in_parent: chosen_pos,
         });
     }
 }
@@ -660,6 +780,13 @@ pub fn plan_insert_extent_deep(
     debug_assert!(leaf_header.is_leaf());
     let mut leaf_entries = parse_leaf_entries(&leaf_frame.bytes, &leaf_header)?;
     check_no_overlap(&leaf_entries, &new)?;
+    // THE KEY A PARENT HOLDS FOR THIS LEAF, which is the leaf's first
+    // logical block. An insert in front of everything moves it, and a parent
+    // still naming the old one describes a tree e2fsck rejects:
+    // "Logical start N does not match logical start M at next level" (#260).
+    // Each index key must equal the first logical block of the subtree it
+    // points at, so every ancestor's key is corrected here.
+    let first_key_before = leaf_entries.first().map(|e| e.logical_block);
     insert_into_leaf_sorted(&mut leaf_entries, new);
 
     // Capacity for this leaf depends on whether it's the inline root or a
@@ -677,6 +804,9 @@ pub fn plan_insert_extent_deep(
     // Initially set by the leaf-split branch below; replaced by the in-loop
     // split branch each time a non-root index node also overflows.
     let mut propagated: Option<PropagatedSplit>;
+    // `(child block, its new first key)`, while a parent still names the old
+    // one.
+    let mut correction: Option<(u64, u32)> = None;
 
     if (leaf_entries.len() as u16) <= leaf_cap {
         // Leaf fits — emit it.
@@ -689,15 +819,21 @@ pub fn plan_insert_extent_deep(
                 allocated_blocks,
             });
         }
-        // Non-root leaf absorbed cleanly — every level above is unchanged,
-        // so the inline root bytes go back verbatim.
         let new_leaf = build_full_leaf_block(generation, &leaf_entries, bs);
         block_writes.push((leaf_frame.block, new_leaf));
-        return Ok(DeepInsertPlan {
-            new_root: root_bytes.to_vec(),
-            block_writes,
-            allocated_blocks,
-        });
+        let first_key = leaf_entries[0].logical_block;
+        if first_key_before == Some(first_key) {
+            // Every level above is unchanged, so the inline root bytes go
+            // back verbatim.
+            return Ok(DeepInsertPlan {
+                new_root: root_bytes.to_vec(),
+                block_writes,
+                allocated_blocks,
+            });
+        }
+        // The leaf's first key moved, so the keys naming it have to follow.
+        propagated = None;
+        correction = Some((leaf_frame.block, first_key));
     } else {
         // Leaf overflowed — split it 50/50.
         if is_root_leaf {
@@ -738,6 +874,10 @@ pub fn plan_insert_extent_deep(
             new_logical: right_first_logical,
             new_child: new_right_block,
         });
+        let left_first = left_entries[0].logical_block;
+        if first_key_before != Some(left_first) {
+            correction = Some((leaf_frame.block, left_first));
+        }
     }
 
     // ---- Walk up internal levels, absorbing the propagated split. ----
@@ -745,17 +885,32 @@ pub fn plan_insert_extent_deep(
     // a level absorbs without overflow (sets propagated=None) only on a
     // path that returns immediately, since every higher level is unchanged.
     while let Some(frame) = path.pop() {
-        let split = propagated
-            .take()
-            .expect("deep insert invariant: propagated must be Some at every loop iter");
-
         let header = ExtentHeader::parse(&frame.bytes)?;
         debug_assert!(!header.is_leaf());
         let mut indices: Vec<(u32, u64)> = parse_index_entries(&frame.bytes, &header)?
             .into_iter()
             .map(|i| (i.logical_block, i.leaf_block))
             .collect();
-        insert_into_index_sorted(&mut indices, split.new_logical, split.new_child);
+
+        // A child whose first key moved is named here; correct it, and pass
+        // the correction on only while it is this node's own first key,
+        // which is what the node above holds for it.
+        if let Some((child, key)) = correction.take() {
+            let at = indices
+                .iter()
+                .position(|(_, block)| *block == child)
+                .ok_or(Error::CorruptExtentTree(
+                    "the index entry naming a child this insert changed is missing",
+                ))?;
+            indices[at].0 = key;
+            if at == 0 && frame.block != 0 {
+                correction = Some((frame.block, key));
+            }
+        }
+
+        if let Some(split) = propagated.take() {
+            insert_into_index_sorted(&mut indices, split.new_logical, split.new_child);
+        }
 
         let is_root_here = path.is_empty();
         let cap = if is_root_here {
@@ -775,6 +930,11 @@ pub fn plan_insert_extent_deep(
             }
             let bytes = build_full_index_block(generation, header.depth, &indices, bs);
             block_writes.push((frame.block, bytes));
+            if correction.is_some() {
+                // This node is written, but the key naming it above moved
+                // too, so the level above still has to be rewritten.
+                continue;
+            }
             // No more propagation — every level above this is unchanged, so
             // the inline root bytes can be returned verbatim.
             return Ok(DeepInsertPlan {
@@ -925,6 +1085,66 @@ pub fn plan_free_extent(root: &[u8], idx: usize) -> Result<Vec<ExtentMutation>> 
     ])
 }
 
+/// Plan marking logical blocks `[first, end)` initialized in an inline-root
+/// leaf, wherever an uninitialized extent covers them.
+///
+/// Each uninitialized extent the range touches is split into at most three:
+/// an uninitialized head, the initialized middle and an uninitialized tail.
+/// A piece contiguous with its neighbour in the same state is merged back.
+/// Returns the new root and the logical blocks that changed state. Those
+/// blocks read as zeros until now, and their physical contents are whatever
+/// was there, so the caller has to write every byte of them.
+///
+/// Errors:
+/// - `multi-level tree mutation not yet supported` on a root that isn't a leaf;
+/// - `LEAF_FULL_NEEDS_PROMOTION` if the pieces don't fit in the root.
+pub fn plan_initialize_range(root: &[u8], first: u32, end: u32) -> Result<(Vec<u8>, Vec<u32>)> {
+    let (header, entries) = read_leaf_entries(root)?;
+    let mut out: Vec<Extent> = Vec::with_capacity(entries.len() + 2);
+    let mut converted = Vec::new();
+    for e in entries {
+        let el = e.logical_block;
+        let er = el + u32::from(e.length);
+        if !e.uninitialized || er <= first || el >= end {
+            out.push(e);
+            continue;
+        }
+        let lo = el.max(first);
+        let hi = er.min(end);
+        let piece = |from: u32, to: u32, uninitialized: bool| Extent {
+            logical_block: from,
+            length: (to - from) as u16,
+            physical_block: e.physical_block + u64::from(from - el),
+            uninitialized,
+        };
+        if el < lo {
+            out.push(piece(el, lo, true));
+        }
+        out.push(piece(lo, hi, false));
+        if hi < er {
+            out.push(piece(hi, er, true));
+        }
+        converted.extend(lo..hi);
+    }
+    let mut merged: Vec<Extent> = Vec::with_capacity(out.len());
+    for e in out {
+        match merged.last_mut() {
+            Some(prev) if are_contiguous(prev, &e) => prev.length += e.length,
+            _ => merged.push(e),
+        }
+    }
+    if merged.len() as u16 > header.max {
+        return Err(Error::CorruptExtentTree(
+            "LEAF_FULL_NEEDS_PROMOTION: initializing part of an extent exceeds root capacity",
+        ));
+    }
+    let header = ExtentHeader {
+        entries: merged.len() as u16,
+        ..header
+    };
+    Ok((build_root(&header, &merged, root.len()), converted))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,8 +1170,132 @@ mod tests {
         }
     }
 
+    /// `n` single-block extents, one every other block.
+    fn striped(n: u32) -> Vec<Extent> {
+        (0..n)
+            .map(|i| ext(i * 2, 1, 1000 + i as u64, false))
+            .collect()
+    }
+
+    /// The layout uses the file's own blocks, and packs every node full.
+    #[test]
+    fn a_repack_uses_the_blocks_the_file_already_holds() {
+        let bs = 1024u32;
+        let cap = node_max_entries(bs as usize) as usize;
+        let entries = striped(3 * cap as u32);
+        let nodes: Vec<u64> = (5000..5100).collect();
+        let mut refused = || {
+            Err(Error::CorruptExtentTree(
+                "a repack of these must not allocate",
+            ))
+        };
+        let plan = plan_repack_tree(7, &entries, bs, &nodes, &mut refused).expect("repack");
+
+        assert_eq!(plan.allocated_blocks, Vec::<u64>::new());
+        assert_eq!(
+            plan.used_nodes,
+            nodes[..3],
+            "three full leaves, nothing more"
+        );
+        assert_eq!(plan.block_writes.len(), 3);
+        let root = ExtentHeader::parse(&plan.new_root).expect("root");
+        assert_eq!((root.depth, root.entries), (1, 3));
+    }
+
+    /// Four or fewer survivors go in the inode, and the file's blocks are
+    /// all left over for the caller to free.
+    #[test]
+    fn a_repack_of_four_entries_needs_no_blocks() {
+        let entries = striped(4);
+        let nodes = [5000u64, 5001];
+        let mut refused = || Err(Error::CorruptExtentTree("must not allocate"));
+        let plan = plan_repack_tree(7, &entries, 1024, &nodes, &mut refused).expect("repack");
+
+        assert!(plan.used_nodes.is_empty() && plan.block_writes.is_empty());
+        let root = ExtentHeader::parse(&plan.new_root).expect("root");
+        assert_eq!((root.depth, root.entries), (0, 4));
+    }
+
+    /// A punch inside one extent leaves a head and a tail where there was one
+    /// record, so the survivors can outnumber the entries — and a tree this
+    /// packed full has no room for the extra. The layout then allocates, and
+    /// only for what it is short (CodeRabbit on #262).
+    #[test]
+    fn a_repack_allocates_only_what_the_file_cannot_cover() {
+        let bs = 1024u32;
+        let cap = node_max_entries(bs as usize) as usize;
+        // A full root over full leaves: four leaves, each packed.
+        let entries = striped((4 * cap + 1) as u32);
+        let nodes: Vec<u64> = (5000..5004).collect();
+        let mut next = 9000u64;
+        let mut alloc = || {
+            next += 1;
+            Ok(next)
+        };
+        let plan = plan_repack_tree(7, &entries, bs, &nodes, &mut alloc).expect("repack");
+
+        // Five leaves for the extra entry, and an index level over them,
+        // because five index entries do not fit the inode's four.
+        assert_eq!(
+            plan.used_nodes, nodes,
+            "every block the file held is reused"
+        );
+        assert_eq!(plan.allocated_blocks, vec![9001, 9002]);
+        assert_eq!(plan.block_writes.len(), 6);
+        let root = ExtentHeader::parse(&plan.new_root).expect("root");
+        assert_eq!((root.depth, root.entries), (2, 1));
+    }
+
     fn read_back(bytes: &[u8]) -> Vec<Extent> {
         read_leaf_entries(bytes).unwrap().1
+    }
+
+    fn shape(extents: Vec<Extent>) -> Vec<(u32, u16, u64, bool)> {
+        extents
+            .iter()
+            .map(|e| (e.logical_block, e.length, e.physical_block, e.uninitialized))
+            .collect()
+    }
+
+    #[test]
+    fn initializing_the_middle_of_an_uninit_extent_splits_it_in_three() {
+        let root = mk_root(&[ext(0, 16, 1000, true)]);
+        let (bytes, converted) = plan_initialize_range(&root, 4, 6).unwrap();
+        assert_eq!(converted, vec![4, 5]);
+        assert_eq!(
+            shape(read_back(&bytes)),
+            vec![(0, 4, 1000, true), (4, 2, 1004, false), (6, 10, 1006, true)]
+        );
+    }
+
+    #[test]
+    fn initializing_all_of_an_uninit_extent_merges_with_an_initialized_neighbour() {
+        let root = mk_root(&[ext(0, 4, 1000, false), ext(4, 4, 1004, true)]);
+        let (bytes, converted) = plan_initialize_range(&root, 4, 20).unwrap();
+        assert_eq!(converted, vec![4, 5, 6, 7]);
+        assert_eq!(shape(read_back(&bytes)), vec![(0, 8, 1000, false)]);
+    }
+
+    #[test]
+    fn initialized_extents_and_ranges_outside_are_left_alone() {
+        let root = mk_root(&[ext(0, 4, 1000, false), ext(10, 4, 2000, true)]);
+        let (bytes, converted) = plan_initialize_range(&root, 0, 10).unwrap();
+        assert!(converted.is_empty());
+        assert_eq!(shape(read_back(&bytes)), shape(read_back(&root)));
+    }
+
+    #[test]
+    fn initializing_that_overflows_the_root_is_refused() {
+        let root = mk_root(&[
+            ext(0, 16, 1000, true),
+            ext(20, 1, 3000, false),
+            ext(30, 1, 4000, false),
+        ]);
+        let err = plan_initialize_range(&root, 4, 6).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("LEAF_FULL_NEEDS_PROMOTION"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1208,5 +1552,187 @@ mod tests {
             Error::CorruptExtentTree(msg) => assert!(msg.contains("multi-level")),
             _ => panic!("wrong error kind"),
         }
+    }
+
+    /// The `WriteRoot` bytes of a single-mutation plan.
+    fn root_of(muts: Vec<ExtentMutation>) -> Vec<u8> {
+        match muts.into_iter().next() {
+            Some(ExtentMutation::WriteRoot { bytes }) => bytes,
+            other => panic!("expected WriteRoot, got {other:?}"),
+        }
+    }
+
+    /// Sum of the lengths, and whether any entry reads back uninitialized.
+    fn total_and_any_uninit(entries: &[Extent]) -> (u64, bool) {
+        (
+            entries.iter().map(|e| e.length as u64).sum(),
+            entries.iter().any(|e| e.uninitialized),
+        )
+    }
+
+    /// Two contiguous initialized extents whose sum passes 32768 stay two
+    /// (#387): one `ee_len` over 32768 reads back as an uninitialized extent.
+    #[test]
+    fn an_insert_does_not_merge_past_the_initialized_extent_limit() {
+        let m = plan_insert_extent(
+            &mk_root(&[ext(0, 32768, 1000, false)]),
+            ext(32768, 1, 33768, false),
+        )
+        .unwrap();
+        let entries = read_back(&root_of(m));
+        assert_eq!(
+            total_and_any_uninit(&entries),
+            (32769, false),
+            "{entries:?}"
+        );
+        assert_eq!(entries.len(), 2, "{entries:?}");
+    }
+
+    /// Two contiguous uninit extents whose sum passes 32767 stay two
+    /// (#387): the merge used to overflow `ee_len`'s u16.
+    #[test]
+    fn an_insert_does_not_merge_past_the_uninit_extent_limit() {
+        let r = std::panic::catch_unwind(|| {
+            plan_insert_extent(
+                &mk_root(&[ext(0, 20000, 1000, true)]),
+                ext(20000, 20000, 21000, true),
+            )
+        });
+        let entries = read_back(&root_of(r.expect("no panic").unwrap()));
+        assert_eq!(total_and_any_uninit(&entries), (40000, true), "{entries:?}");
+        assert!(entries.iter().all(|e| e.uninitialized), "{entries:?}");
+    }
+
+    /// A merge exactly at the limit still happens: the cap is `<=`.
+    #[test]
+    fn an_insert_still_merges_up_to_the_limit() {
+        let m = plan_insert_extent(
+            &mk_root(&[ext(0, 32767, 1000, false)]),
+            ext(32767, 1, 33767, false),
+        )
+        .unwrap();
+        let entries = read_back(&root_of(m));
+        assert_eq!(shape(entries), vec![(0, 32768, 1000, false)]);
+        let m = plan_insert_extent(
+            &mk_root(&[ext(0, 32766, 1000, true)]),
+            ext(32766, 1, 33766, true),
+        )
+        .unwrap();
+        assert_eq!(shape(read_back(&root_of(m))), vec![(0, 32767, 1000, true)]);
+    }
+
+    /// A merge with the right-hand neighbour is capped too.
+    #[test]
+    fn an_insert_does_not_merge_right_past_the_limit() {
+        let m = plan_insert_extent(
+            &mk_root(&[ext(1, 32768, 1001, false)]),
+            ext(0, 1, 1000, false),
+        )
+        .unwrap();
+        let entries = read_back(&root_of(m));
+        assert_eq!(
+            total_and_any_uninit(&entries),
+            (32769, false),
+            "{entries:?}"
+        );
+    }
+
+    /// `plan_merge_adjacent` refuses a pair whose sum passes the limit.
+    #[test]
+    fn an_explicit_merge_does_not_pass_the_extent_limit() {
+        let root = mk_root(&[ext(0, 30000, 1000, false), ext(30000, 5000, 31000, false)]);
+        let m = plan_merge_adjacent(&root, 0).unwrap();
+        assert!(m.is_empty(), "a merge past 32768 was planned: {m:?}");
+    }
+
+    /// The deep-tree leaf insert (`insert_into_leaf_sorted`) is capped too.
+    #[test]
+    fn a_deep_leaf_insert_does_not_merge_past_the_extent_limit() {
+        let mut entries = vec![ext(0, 30000, 1000, false)];
+        insert_into_leaf_sorted(&mut entries, ext(30000, 5000, 31000, false));
+        assert_eq!(
+            total_and_any_uninit(&entries),
+            (35000, false),
+            "{entries:?}"
+        );
+        assert!(entries.iter().all(|e| e.length <= 32768), "{entries:?}");
+    }
+
+    /// Promoting a full root to depth 1 does not merge past the limit.
+    #[test]
+    fn a_promotion_does_not_merge_past_the_extent_limit() {
+        let root = mk_root(&[
+            ext(0, 5, 1000, false),
+            ext(100, 5, 2000, false),
+            ext(200, 5, 3000, false),
+            ext(300, 30000, 4000, false),
+        ]);
+        let plan =
+            plan_promote_leaf(&root, ext(30300, 5000, 34000, false), 4096, 123, false).unwrap();
+        let hdr = ExtentHeader::parse(&plan.leaf_bytes).unwrap();
+        let entries = read_back(&plan.leaf_bytes[..12 + hdr.entries as usize * 12]);
+        assert_eq!(
+            total_and_any_uninit(&entries),
+            (35015, false),
+            "{entries:?}"
+        );
+    }
+
+    /// Index node bytes: `entries` index entries (all at logical 0, all
+    /// pointing at `child`) under a header claiming `max`, at `depth`.
+    fn index_node(len: usize, entries: u16, max: u16, depth: u16, child: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        buf[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+        buf[2..4].copy_from_slice(&entries.to_le_bytes());
+        buf[4..6].copy_from_slice(&max.to_le_bytes());
+        buf[6..8].copy_from_slice(&depth.to_le_bytes());
+        for i in 0..entries as usize {
+            let off = extent_entry_offset(i);
+            if off + EXT4_EXT_NODE_SIZE > len {
+                break;
+            }
+            let (hi, lo) = split_phys_block(child);
+            buf[off + 4..off + 8].copy_from_slice(&lo.to_le_bytes());
+            buf[off + 8..off + 10].copy_from_slice(&hi.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Serves one block for every read.
+    struct OneBlock(Vec<u8>);
+
+    impl DeepReader for OneBlock {
+        fn read_block(&self, _block: u64, out: &mut [u8]) -> Result<()> {
+            out.copy_from_slice(&self.0);
+            Ok(())
+        }
+    }
+
+    /// `ExtentHeader::parse` checks `entries <= max` but not `max` against
+    /// the node, so a 60-byte root claiming five index entries sent the
+    /// descent slicing `[60..72]` (#327).
+    #[test]
+    fn a_root_claiming_more_index_entries_than_it_holds_is_refused() {
+        let root = index_node(60, 5, 5, 1, 7000);
+        let reader = OneBlock(vec![0u8; 1024]);
+        let mut alloc = || -> Result<u64> { panic!("nothing is allocated") };
+        let err =
+            plan_insert_extent_deep(&root, ext(1000, 1, 9000, false), 1024, &reader, &mut alloc)
+                .expect_err("a root with five index entries in a four-entry area");
+        assert!(matches!(err, Error::CorruptExtentTree(_)), "{err:?}");
+    }
+
+    /// The same through a child block whose header claims more entries
+    /// than the block holds (#327).
+    #[test]
+    fn a_child_claiming_more_index_entries_than_its_block_holds_is_refused() {
+        let root = index_node(60, 1, 4, 2, 7000);
+        // 100 entries of 12 bytes after a 12-byte header: 1212 > 1024.
+        let reader = OneBlock(index_node(1024, 100, 100, 1, 7001));
+        let mut alloc = || -> Result<u64> { panic!("nothing is allocated") };
+        let err =
+            plan_insert_extent_deep(&root, ext(1000, 1, 9000, false), 1024, &reader, &mut alloc)
+                .expect_err("a child with a hundred index entries in a 1 KiB block");
+        assert!(matches!(err, Error::CorruptExtentTree(_)), "{err:?}");
     }
 }

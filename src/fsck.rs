@@ -28,17 +28,21 @@
 use crate::bgd;
 use crate::dir::{self, DirBlockIter, DirEntryType};
 use crate::error::{Error, Result};
-use crate::extent;
 use crate::features;
 use crate::fs::{BlockBuffer, Filesystem};
 use crate::inode::Inode;
+use crate::runtime::Stopwatch;
 use crate::superblock::Superblock;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// One problem found by [`audit`]. Each variant carries the inode or
 /// path needed to act on the finding.
+///
+/// `#[non_exhaustive]`: the audit learns new findings, and a `match` on
+/// this outside the crate needs a `_` arm so a new one does not break it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Anomaly {
     /// A directory entry references an inode whose `i_links_count` is
     /// *less than* the observed reference count. Stored value is too
@@ -130,6 +134,32 @@ pub enum Anomaly {
         /// removes the rest.
         dirents: Vec<(u32, String)>,
     },
+    /// A directory block's checksum does not match its contents: e2fsck's
+    /// "directory passes checks but fails checksum" for a linear block, and
+    /// "root node fails checksum" / "internal node fails checksum" when
+    /// `htree` is set and the block is an htree index.
+    ///
+    /// Only reported on `metadata_csum` volumes, and only for a block that
+    /// carries a checksum to check. A repair never restamps a block whose
+    /// checksum fails unless it is repairing this finding (#344): the
+    /// repair pass fixes the checksum of a linear block that passes the
+    /// structural checks, as e2fsck does, and leaves an htree index, which
+    /// e2fsck rebuilds, reported and untouched.
+    DirBlockChecksumMismatch {
+        dir_ino: u32,
+        logical_block: u64,
+        htree: bool,
+    },
+    /// A directory the walk could not read: its inode does not verify, or
+    /// its entries cannot be listed (an extent tree that does not parse, a
+    /// block that cannot be read). Nothing beneath it was examined, so the
+    /// audit cannot call the volume clean (#445). `reason` is the error the
+    /// read failed with.
+    ///
+    /// Not repairable: e2fsck clears such an inode (`Inode 2 has corrupt
+    /// extent header.  Clear inode?`), which loses everything beneath it,
+    /// and that is not a decision this repair pass makes.
+    UnreadableDirectory { ino: u32, reason: String },
 }
 
 /// Summary returned by [`audit`]. Empty `anomalies` means the subset
@@ -284,6 +314,18 @@ where
 /// Findings are emitted through `on_finding`; nothing is pushed onto
 /// `report.anomalies` from here. Callers that want the legacy
 /// "collect into a vec" behaviour wrap `on_finding` accordingly.
+/// The audits compare block bitmaps and descriptor free counts with the
+/// blocks they observe. Under BIGALLOC both count clusters, so every group
+/// would be reported inconsistent (#75).
+pub(crate) fn refuse_bigalloc(fs: &Filesystem) -> Result<()> {
+    if fs.sb.feature_ro_compat & crate::features::RoCompat::BIGALLOC.bits() != 0 {
+        return Err(crate::error::Error::Unsupported(
+            "bigalloc: bitmaps and group free counts are in clusters, which the audit does not model",
+        ));
+    }
+    Ok(())
+}
+
 fn audit_inner(
     fs: &Filesystem,
     max_dirs_visited: u32,
@@ -292,6 +334,7 @@ fn audit_inner(
     on_finding: &mut dyn FnMut(&Anomaly),
     report: &mut AuditReport,
 ) -> Result<()> {
+    refuse_bigalloc(fs)?;
     // Observed: ino → reference-count.
     let mut observed: HashMap<u32, u32> = HashMap::new();
     // What each directory's ".." entry CLAIMS the parent is (read off
@@ -303,10 +346,14 @@ fn audit_inner(
     // up as we pop work items. Root maps to itself by convention so a
     // corrupted root ".." still flags WrongDotDot.
     let mut actual_parent: HashMap<u32, u32> = HashMap::new();
-    // Directories we couldn't fully walk (parse failure, inline overflow
-    // we don't decode, bound cap). Any link-count anomalies that could
+    // Directories we couldn't fully walk (parse failure, bound cap). Any link-count anomalies that could
     // have been explained by their missing entries are suppressed below.
     let mut incomplete_dirs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Directories reported as `UnreadableDirectory`, so the link-count
+    // pass does not report the same unreadable inode a second time as a
+    // dangling entry.
+    let mut unreadable_dirs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
     // ino → list of (parent_ino, name_bytes) that reference it. Skips
     // "." / ".." (those are self-references, not aliases). Kept as
     // bytes so non-UTF-8 names (legal on ext4) round-trip; the
@@ -340,7 +387,11 @@ fn audit_inner(
             incomplete_dirs.insert(dir_ino);
             break;
         }
-        if !visited.insert(dir_ino) {
+        // Only a confirmed directory is marked visited (below, after
+        // the type check): a second Directory-typed dirent naming the
+        // same regular file must reach the check too and be its own
+        // BogusEntry, or repair needs two runs to converge (#325).
+        if visited.contains(&dir_ino) {
             continue;
         }
         // Record who really enqueued us. `parent_ino` is the directory
@@ -351,10 +402,16 @@ fn audit_inner(
         actual_parent.entry(dir_ino).or_insert(parent_ino);
         report.directories_scanned += 1;
 
-        let (inode, _raw) = match fs.read_inode_verified(dir_ino) {
+        let (inode, raw) = match fs.read_inode_verified(dir_ino) {
             Ok(p) => p,
-            Err(_) => {
+            Err(e) => {
                 incomplete_dirs.insert(dir_ino);
+                unreadable_dirs.insert(dir_ino);
+                on_finding(&Anomaly::UnreadableDirectory {
+                    ino: dir_ino,
+                    reason: e.to_string(),
+                });
+                report.anomalies_count += 1;
                 emit_dir_progress(on_progress, report.directories_scanned, work.len());
                 continue;
             }
@@ -376,20 +433,37 @@ fn audit_inner(
             emit_dir_progress(on_progress, report.directories_scanned, work.len());
             continue;
         }
+        visited.insert(dir_ino);
 
-        // Skip directories the audit can't fully enumerate (inline dirs
-        // whose entries overflow into the xattr region — a valid
-        // on-disk layout we don't decode here).
-        if inode.has_inline_data() {
-            incomplete_dirs.insert(dir_ino);
-            emit_dir_progress(on_progress, report.directories_scanned, work.len());
-            continue;
+        let mut bad_checksums: Vec<(u64, bool)> = Vec::new();
+        let collected = collect_dir_entries_checked(
+            fs,
+            dir_ino,
+            &inode,
+            &raw,
+            has_filetype,
+            block_size,
+            Some(&mut |logical, htree| bad_checksums.push((logical, htree))),
+        );
+        for (logical_block, htree) in bad_checksums {
+            let a = Anomaly::DirBlockChecksumMismatch {
+                dir_ino,
+                logical_block,
+                htree,
+            };
+            on_finding(&a);
+            report.anomalies_count += 1;
         }
-
-        let entries = match collect_dir_entries(fs, &inode, has_filetype, block_size) {
+        let entries = match collected {
             Ok(e) => e,
-            Err(_) => {
+            Err(e) => {
                 incomplete_dirs.insert(dir_ino);
+                unreadable_dirs.insert(dir_ino);
+                on_finding(&Anomaly::UnreadableDirectory {
+                    ino: dir_ino,
+                    reason: e.to_string(),
+                });
+                report.anomalies_count += 1;
                 emit_dir_progress(on_progress, report.directories_scanned, work.len());
                 continue;
             }
@@ -442,8 +516,9 @@ fn audit_inner(
     // under-counted) but still report TooLow (we already saw more than
     // the stored value — the image is genuinely wrong).
     let have_incomplete = !incomplete_dirs.is_empty();
+    let dir_nlink = fs.sb.feature_ro_compat & crate::features::RoCompat::DIR_NLINK.bits() != 0;
     let mut inodes_done: u64 = 0;
-    let mut last_tick = Instant::now();
+    let mut last_tick = Stopwatch::start();
     let tick = Duration::from_millis(500);
     for (&ino, &count) in observed.iter() {
         match fs.read_inode_verified(ino) {
@@ -459,7 +534,13 @@ fn audit_inner(
                     report.anomalies_count += 1;
                     continue;
                 }
-                if (stored as u32) < count {
+                // On a DIR_NLINK volume a directory count of 1 means "not
+                // known" (the format documentation's `i_links_count` entry:
+                // a count past MAX_LINKS is stored as 1, and removing a
+                // subdirectory never moves it), not a count that is too
+                // low.
+                let uncounted = stored == 1 && inode.is_dir() && dir_nlink;
+                if (stored as u32) < count && !uncounted {
                     let a = Anomaly::LinkCountTooLow {
                         ino,
                         stored,
@@ -478,6 +559,9 @@ fn audit_inner(
                     report.anomalies_count += 1;
                 }
             }
+            Err(_) if unreadable_dirs.contains(&ino) => {
+                // Already reported by the walk as an unreadable directory.
+            }
             Err(_) => {
                 // Unreadable inode that somebody linked to. Surface
                 // observed = 0 as a sentinel meaning "rescue not safe"
@@ -495,7 +579,7 @@ fn audit_inner(
         inodes_done += 1;
         if last_tick.elapsed() >= tick {
             on_progress(FsckPhase::Inodes, inodes_done, inodes_total.max(1));
-            last_tick = Instant::now();
+            last_tick = Stopwatch::start();
         }
     }
 
@@ -599,11 +683,12 @@ fn audit_free_counts(
     // Re-read BGDs and SB from disk for each scan rather than
     // trusting `fs.groups` / `fs.sb` (mount-time snapshots, never
     // mutated). The post-repair re-scan needs the patched values to
-    // avoid re-emitting drift findings the repair pass just fixed:
-    // bitmaps come from `fs.read_block` (sees pinned post-commit
-    // bytes), so the comparison's "stored" side has to match — read
-    // the descriptors and SB the same way for both halves of the
-    // compare to look at the same point in time.
+    // avoid re-emitting drift findings the repair pass just fixed.
+    // Every read here, the bitmaps and these descriptors alike, goes
+    // through `fs.dev`, which the mount wrapped in a `CachedDevice`
+    // (`Filesystem::mount_inner`); that cache holds the pinned
+    // post-commit, pre-checkpoint bytes, so both halves of the compare
+    // see the same point in time.
     let live_groups = bgd::read_all(fs.dev.as_ref(), &fs.sb, &fs.csum)?;
     let live_sb = Superblock::read(fs.dev.as_ref())?;
 
@@ -613,21 +698,36 @@ fn audit_free_counts(
     for (gi, bg) in live_groups.iter().enumerate() {
         // Block bitmap: count zero bits across the bytes covering the
         // bits that actually correspond to this group's blocks. The
-        // last group may be partial. Go through `read_block` so the
-        // post-repair re-scan sees post-commit-pre-checkpoint pinned
-        // bytes — `dev.read_at` would skip the cache and surface the
-        // stale on-disk image, falsely re-emitting drift findings the
-        // repair pass just fixed.
+        // last group may be partial. The post-repair re-scan sees the
+        // pinned post-commit bytes here because the cache is in the
+        // device: `fs.read_block` is `fs.dev.read_at` with the offset
+        // worked out, and neither can skip the `CachedDevice`. Seeing the
+        // stale on-disk image would mean reaching past it deliberately,
+        // and nothing here does (#152).
         let group_first_block = first_data + gi as u64 * bpg;
         let group_block_count = std::cmp::min(bpg, total_blocks.saturating_sub(group_first_block));
-        let block_bitmap = fs.read_block(bg.block_bitmap)?;
+        //
+        // A BLOCK_UNINIT group's bitmap block is unspecified — mke2fs
+        // never writes it — so it is rebuilt from the group's metadata,
+        // exactly as the allocator reads it, rather than counted (#391).
+        let block_bitmap = if bg.flags().contains(bgd::BgdFlags::BLOCK_UNINIT) {
+            crate::alloc::uninit_block_bitmap(&fs.sb, &live_groups, gi as u32)
+        } else {
+            fs.read_block(bg.block_bitmap)?
+        };
         let observed_blocks = count_zero_bits_le(&block_bitmap, group_block_count as u32);
 
         // Inode bitmap: every group has exactly inodes_per_group
         // inodes (the ext4 layout doesn't leave a partial last group
-        // for inodes; the trailing bits are reserved-as-1).
-        let inode_bitmap = fs.read_block(bg.inode_bitmap)?;
-        let observed_inodes = count_zero_bits_le(&inode_bitmap, ipg as u32);
+        // for inodes; the trailing bits are reserved-as-1). An
+        // INODE_UNINIT group has every inode free, whatever its
+        // unwritten bitmap block holds.
+        let observed_inodes = if bg.flags().contains(bgd::BgdFlags::INODE_UNINIT) {
+            ipg as u32
+        } else {
+            let inode_bitmap = fs.read_block(bg.inode_bitmap)?;
+            count_zero_bits_le(&inode_bitmap, ipg as u32)
+        };
 
         sum_free_blocks += observed_blocks as u64;
         sum_free_inodes += observed_inodes as u64;
@@ -700,26 +800,173 @@ fn emit_dir_progress(
 
 fn collect_dir_entries(
     fs: &Filesystem,
+    ino: u32,
     inode: &Inode,
+    inode_raw: &[u8],
     has_filetype: bool,
     block_size: u32,
 ) -> Result<Vec<crate::dir::DirEntry>> {
-    let mut entries = Vec::new();
-    if inode.has_inline_data() {
-        for entry in DirBlockIter::new(&inode.block, has_filetype) {
-            entries.push(entry?);
+    collect_dir_entries_checked(fs, ino, inode, inode_raw, has_filetype, block_size, None)
+}
+
+/// What a directory block's checksum says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirBlockChecksum {
+    /// Nothing to check: no `metadata_csum`, or no tail in this block.
+    Unchecked,
+    /// The stored checksum matches the block.
+    Matches,
+    /// The stored checksum does not match; `htree` when the block is an
+    /// htree index and the checksum is its `dx_tail`'s.
+    Mismatch { htree: bool },
+}
+
+/// Check logical block `logical` of directory `dir_ino` against its
+/// checksum, as e2fsck's pass 2 does.
+///
+/// An htree index block is checked as one: block 0 of an indexed directory
+/// is the dx_root and a block whose first record is an empty entry spanning
+/// it is a dx_node (`Filesystem::is_htree_index_block`, the format's rule).
+/// Its checksum is the `dx_tail`'s, and only a count/limit pair that leaves
+/// exactly room for one says there is a tail to check: the format
+/// documentation places `struct dx_tail` right after the `limit` entries a
+/// block holds. A kernel-grown dx_root ends
+/// in bytes that look like a dirent tail (#233), which is why the index
+/// test comes first.
+fn dir_block_checksum(
+    fs: &Filesystem,
+    dir_ino: u32,
+    dir: &Inode,
+    logical: u64,
+    block: &[u8],
+) -> DirBlockChecksum {
+    if !fs.csum.enabled {
+        return DirBlockChecksum::Unchecked;
+    }
+    if Filesystem::is_htree_index_block(dir, logical, block) {
+        let count_offset = if logical == 0 {
+            // dx_root_info's length byte; the format fixes it at 8.
+            if block.get(29) != Some(&8) {
+                return DirBlockChecksum::Unchecked;
+            }
+            32
+        } else {
+            8
+        };
+        let Some(pair) = block.get(count_offset..count_offset + 2) else {
+            return DirBlockChecksum::Unchecked;
+        };
+        let limit = u16::from_le_bytes([pair[0], pair[1]]) as usize;
+        if count_offset + limit * 8 + 8 != block.len() {
+            return DirBlockChecksum::Unchecked;
         }
-        return Ok(entries);
+        return match fs
+            .csum
+            .verify_dx_tail(dir_ino, dir.generation, block, count_offset)
+        {
+            Some(true) => DirBlockChecksum::Matches,
+            Some(false) => DirBlockChecksum::Mismatch { htree: true },
+            None => DirBlockChecksum::Unchecked,
+        };
     }
-    if !inode.has_extents() {
-        return Err(Error::Corrupt(
-            "legacy non-extent dirs not supported by audit",
-        ));
+    if !dir::has_csum_tail(block) {
+        return DirBlockChecksum::Unchecked;
     }
+    if fs
+        .csum
+        .verify_dir_entry_tail(dir_ino, dir.generation, block)
+    {
+        DirBlockChecksum::Matches
+    } else {
+        DirBlockChecksum::Mismatch { htree: false }
+    }
+}
+
+/// Whether a repair may edit this directory block and restamp it.
+///
+/// Only a block whose checksum matches, or that has none to check. A block
+/// whose checksum fails has been reported as a `DirBlockChecksumMismatch`,
+/// and the repair pass fixes those before any other directory edit, so a
+/// block that still fails here is one that repair declined: restamping it
+/// would bless whatever it holds with a valid checksum and destroy the
+/// evidence (#344, the fsck twin of #161 and #322).
+fn may_restamp(fs: &Filesystem, dir_ino: u32, dir: &Inode, logical: u64, block: &[u8]) -> bool {
+    !matches!(
+        dir_block_checksum(fs, dir_ino, dir, logical, block),
+        DirBlockChecksum::Mismatch { .. }
+    )
+}
+
+/// Whether a linear directory block with a dirent tail passes the
+/// structural checks e2fsck makes before it will only fix the checksum:
+/// every record's `rec_len` is at least 8, a multiple of 4 and inside the
+/// block, its name fits in it, and the chain ends exactly at the tail.
+fn dir_block_passes_checks(block: &[u8], has_filetype: bool) -> bool {
+    let Some(end) = block.len().checked_sub(12) else {
+        return false;
+    };
+    let mut off = 0usize;
+    while off < end {
+        if off + 8 > end {
+            return false;
+        }
+        let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
+        if rec_len < 8 || !rec_len.is_multiple_of(4) || off + rec_len > end {
+            return false;
+        }
+        let name_len = if has_filetype {
+            block[off + 6] as usize
+        } else {
+            ((block[off + 7] as usize) << 8) | block[off + 6] as usize
+        };
+        if 8 + name_len > rec_len {
+            return false;
+        }
+        off += rec_len;
+    }
+    off == end
+}
+
+/// [`collect_dir_entries`], reporting every block whose checksum does not
+/// match through `on_bad_checksum(logical, htree)` when one is given.
+/// `inode_raw` is the directory's on-disk inode, for the `system.data`
+/// xattr an inline directory's entries continue into.
+fn collect_dir_entries_checked(
+    fs: &Filesystem,
+    dir_ino: u32,
+    inode: &Inode,
+    inode_raw: &[u8],
+    has_filetype: bool,
+    block_size: u32,
+    mut on_bad_checksum: Option<&mut dyn FnMut(u64, bool)>,
+) -> Result<Vec<crate::dir::DirEntry>> {
+    if inode.has_inline_data() {
+        // `.` and `..` synthesised, entries from byte 4 and then from the
+        // `system.data` continuation (#427).
+        return crate::inline_data::read_dir(
+            fs.dev.as_ref(),
+            dir_ino,
+            inode,
+            inode_raw,
+            fs.sb.inode_size,
+            block_size,
+            has_filetype,
+        );
+    }
+    let mut entries = Vec::new();
+    // Extent-mapped or block-mapped (ext2, ext3): both are read. The walk
+    // used to refuse a block-mapped directory, so on those volumes it
+    // examined nothing below the root (#445).
     let total_blocks = inode.size.div_ceil(block_size as u64);
     let mut buf = vec![0u8; block_size as usize];
     for logical in 0..total_blocks {
-        let Some(phys) = extent::map_logical(&inode.block, fs.dev.as_ref(), block_size, logical)?
+        let Some(phys) = crate::indirect::map_logical_any(
+            &inode.block,
+            inode.flags,
+            fs.dev.as_ref(),
+            block_size,
+            logical,
+        )?
         else {
             continue;
         };
@@ -727,11 +974,21 @@ fn collect_dir_entries(
             .checked_mul(block_size as u64)
             .ok_or(Error::Corrupt("audit: dir block offset overflow"))?;
         fs.dev.read_at(offset, &mut buf)?;
+        if let Some(on_bad_checksum) = on_bad_checksum.as_mut() {
+            if let DirBlockChecksum::Mismatch { htree } =
+                dir_block_checksum(fs, dir_ino, inode, logical, &buf)
+            {
+                on_bad_checksum(logical, htree);
+            }
+        }
         for entry in DirBlockIter::new(&buf, has_filetype) {
-            // Ignore parse errors on dx_root first block of indexed dirs
+            // Ignore parse errors on dx_root first block of indexed dirs.
+            // `break`, not `continue`: the iterator does not advance past
+            // a record it refused, so `continue` asked it for the same
+            // record forever and the audit never returned.
             match entry {
                 Ok(e) => entries.push(e),
-                Err(_) if logical == 0 => continue,
+                Err(_) if logical == 0 => break,
                 Err(e) => return Err(e),
             }
         }
@@ -753,6 +1010,12 @@ fn collect_dir_entries(
 ///   subdirectories.
 /// - [`Anomaly::LinkCountTooLow`] / [`Anomaly::LinkCountTooHigh`]: writes
 ///   the observed count back into `i_links_count`.
+/// - [`Anomaly::DirBlockChecksumMismatch`] on a linear block that passes
+///   the structural checks: recomputes its checksum. No repair restamps a
+///   directory block whose checksum fails otherwise (#344).
+///
+/// Repairs run in e2fsck's order: directory-block checksums, then dirent
+/// edits, then counts, re-counted after the edits when any landed.
 ///
 /// Each repair commit is its own [`BlockBuffer`] transaction. Crash
 /// mid-pass: the surviving on-disk state is the union of fixes that
@@ -777,11 +1040,19 @@ where
     P: FnMut(FsckPhase, u64, u64),
     F: FnMut(&Anomaly),
 {
-    // Refuse repair on read-only mounts before any scanning. The full
-    // walk is expensive, and a refused repair shouldn't look like a
-    // partially-successful audit to the caller.
-    if repair && !fs.dev.is_writable() {
-        return Err(Error::ReadOnly);
+    // Refuse repair before any scanning. The full walk is expensive, and
+    // a refused repair shouldn't look like a partially-successful audit
+    // to the caller.
+    //
+    // THE SAME GUARD AS EVERY OTHER WRITE. This used to check only that
+    // the device was writable, so a volume with a feature this driver
+    // does not maintain -- which refuses a create -- was repaired, and
+    // unjournaled, because the mount opens no journal writer on such a
+    // volume (#119). `refuse_write` still answers a read-only device with
+    // `ReadOnly`.
+    let _write_guard = if repair { Some(fs.lock_write()?) } else { None };
+    if repair {
+        fs.refuse_write()?;
     }
 
     let mut report = AuditReport::default();
@@ -830,22 +1101,29 @@ where
         })
         .collect();
 
+    // In e2fsck's order. Directory blocks first (pass 2): their checksums
+    // before anything edits them, so every later edit meets a block that
+    // verifies or one repair declined and must leave alone (#344). Then
+    // the dirent edits (passes 2 and 3). Then the counts (passes 4 and 5),
+    // judged against the tree those edits left: a wrong `..` moves one
+    // reference from the directory it claims to the true parent, and
+    // counts taken before it is fixed would be "repaired" to match the
+    // mistake.
+    for finding in &collected {
+        if let Anomaly::DirBlockChecksumMismatch {
+            dir_ino,
+            logical_block,
+            htree,
+        } = finding
+        {
+            repair_dir_block_checksum(fs, *dir_ino, *logical_block, *htree, &mut report)?;
+        }
+    }
+    let before_dirent_edits = report.repaired_count;
     for finding in &collected {
         match finding {
             Anomaly::DuplicateDirentForDirInode { ino, dirents } => {
                 repair_duplicate_dir_inode(fs, *ino, dirents, &mut report)?;
-            }
-            Anomaly::LinkCountTooLow {
-                ino,
-                stored: _,
-                observed,
-            }
-            | Anomaly::LinkCountTooHigh {
-                ino,
-                stored: _,
-                observed,
-            } => {
-                repair_link_count(fs, *ino, *observed, &mut report)?;
             }
             Anomaly::WrongDotDot {
                 dir_ino,
@@ -864,6 +1142,39 @@ where
                 name,
             } => {
                 repair_bogus_entry(fs, *parent_ino, *child_ino, name, &mut report)?;
+            }
+            _ => {}
+        }
+    }
+    // The counts as the edited tree has them. Unchanged when no dirent was
+    // edited, so the common case walks once.
+    let counts_from: Vec<Anomaly> = if report.repaired_count == before_dirent_edits {
+        collected.clone()
+    } else {
+        let mut recount = Vec::new();
+        audit_inner(
+            fs,
+            max_dirs_visited,
+            max_entries_per_dir,
+            &mut on_progress,
+            &mut |a| recount.push(a.clone()),
+            &mut AuditReport::default(),
+        )?;
+        recount
+    };
+    for finding in &counts_from {
+        match finding {
+            Anomaly::LinkCountTooLow {
+                ino,
+                stored: _,
+                observed,
+            }
+            | Anomaly::LinkCountTooHigh {
+                ino,
+                stored: _,
+                observed,
+            } => {
+                repair_link_count(fs, *ino, *observed, &mut report)?;
             }
             Anomaly::DanglingEntry {
                 parent_ino: _,
@@ -909,6 +1220,11 @@ where
                     &mut report,
                 )?;
             }
+            Anomaly::DirBlockChecksumMismatch { .. }
+            | Anomaly::UnreadableDirectory { .. }
+            | Anomaly::DuplicateDirentForDirInode { .. }
+            | Anomaly::WrongDotDot { .. }
+            | Anomaly::BogusEntry { .. } => {}
         }
     }
 
@@ -1000,6 +1316,17 @@ fn repair_duplicate_dir_inode(
                 continue;
             };
             let block = buf.get_mut(fs, phys)?;
+            if !may_restamp(fs, *parent_ino, &parent_inode, logical, block) {
+                // A block repair declined to fix. If the alias is in it,
+                // leave the alias too rather than restamp the block.
+                let here = DirBlockIter::new(block, has_ft)
+                    .map_while(|e| e.ok())
+                    .any(|e| e.name == name.as_bytes());
+                if here {
+                    break;
+                }
+                continue;
+            }
             // dir_entry_tail occupies the last 12 bytes when
             // metadata_csum is on. Mirror apply_unlink's reservation
             // so removal doesn't scribble the tail.
@@ -1010,12 +1337,8 @@ fn repair_duplicate_dir_inode(
             };
             if dir::remove_entry_from_block(block, name.as_bytes(), has_ft, reserved_tail)? {
                 if fs.csum.enabled && reserved_tail == 12 {
-                    let end = block.len();
-                    let mut c =
-                        crate::checksum::linux_crc32c(fs.csum.seed, &parent_ino.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                    block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                    fs.csum
+                        .patch_dir_entry_tail(*parent_ino, parent_inode.generation, block);
                 }
                 removed = true;
                 break;
@@ -1042,7 +1365,7 @@ fn repair_duplicate_dir_inode(
     if !kept_inode.is_dir() {
         return Ok(());
     }
-    let subdir_count = count_subdirs(fs, &kept_inode, has_ft, bs)?;
+    let subdir_count = count_subdirs(fs, ino, &kept_inode, &kept_raw, has_ft, bs)?;
     let new_nlink: u16 = 2u16.saturating_add(subdir_count.min(u16::MAX as u32 - 2) as u16);
     kept_raw[0x1A..0x1C].copy_from_slice(&new_nlink.to_le_bytes());
     finalize_and_commit_inode(fs, ino, kept_inode.generation, &mut kept_raw)?;
@@ -1054,11 +1377,13 @@ fn repair_duplicate_dir_inode(
 /// `i_links_count` from scratch after removing duplicate dirents.
 fn count_subdirs(
     fs: &Filesystem,
+    dir_ino: u32,
     dir_inode: &Inode,
+    dir_raw: &[u8],
     has_filetype: bool,
     block_size: u32,
 ) -> Result<u32> {
-    let entries = collect_dir_entries(fs, dir_inode, has_filetype, block_size)?;
+    let entries = collect_dir_entries(fs, dir_ino, dir_inode, dir_raw, has_filetype, block_size)?;
     let mut n = 0u32;
     for e in entries {
         if e.name == b"." || e.name == b".." {
@@ -1104,7 +1429,18 @@ fn repair_link_count(
         return Ok(());
     }
     let (inode, mut raw) = fs.read_inode_verified(ino)?;
-    raw[0x1A..0x1C].copy_from_slice(&(observed as u16).to_le_bytes());
+    // A directory past MAX_LINKS is written as the DIR_NLINK "too many
+    // to count" value, as e2fsck pass 4 does; without DIR_NLINK there is
+    // no count to write.
+    let count = if inode.is_dir() && observed > crate::fs::MAX_LINKS as u32 {
+        if fs.sb.feature_ro_compat & crate::features::RoCompat::DIR_NLINK.bits() == 0 {
+            return Ok(());
+        }
+        1u16
+    } else {
+        observed as u16
+    };
+    raw[0x1A..0x1C].copy_from_slice(&count.to_le_bytes());
     finalize_and_commit_inode(fs, ino, inode.generation, &mut raw)?;
     report.repaired_count += 1;
     Ok(())
@@ -1143,7 +1479,20 @@ fn repair_wrong_dotdot(
     };
     let mut buf = BlockBuffer::new(bs);
     let block = buf.get_mut(fs, phys)?;
-    let reserved_tail = if fs.csum.enabled && dir::has_csum_tail(block) {
+    if !may_restamp(fs, dir_ino, &dir_inode, 0, block) {
+        // Its checksum fails and repair declined to fix it: restamping it
+        // here would launder whatever it holds (#344).
+        return Ok(());
+    }
+    // An indexed directory's block 0 is its dx_root, whose checksum is the
+    // dx_tail's and covers `..`. A kernel-grown root also ends in bytes
+    // that look like a dirent tail (#233); stamping one there would
+    // overwrite the index's own tail.
+    let index = Filesystem::is_htree_index_block(&dir_inode, 0, block);
+    if index && block.get(29) != Some(&8) {
+        return Ok(());
+    }
+    let reserved_tail = if !index && fs.csum.enabled && dir::has_csum_tail(block) {
         12
     } else {
         0
@@ -1173,14 +1522,14 @@ fn repair_wrong_dotdot(
         return Ok(());
     }
 
-    // Recompute the dir block CRC if metadata_csum reserved a tail.
-    // Same recipe as repair_duplicate_dir_inode — see comments there.
-    if fs.csum.enabled && reserved_tail == 12 {
-        let end = block.len();
-        let mut c = crate::checksum::linux_crc32c(fs.csum.seed, &dir_ino.to_le_bytes());
-        c = crate::checksum::linux_crc32c(c, &dir_inode.generation.to_le_bytes());
-        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+    // Recompute the block's checksum: the index's for a dx_root, else the
+    // dirent tail's when metadata_csum reserved one.
+    if index {
+        fs.csum
+            .patch_dx_tail(dir_ino, dir_inode.generation, block, 32);
+    } else if fs.csum.enabled && reserved_tail == 12 {
+        fs.csum
+            .patch_dir_entry_tail(dir_ino, dir_inode.generation, block);
     }
 
     fs.commit_block_buffer(buf)?;
@@ -1237,19 +1586,10 @@ fn repair_bogus_entry(
     // Read the child to determine its actual file_type. If it's
     // genuinely unreadable or genuinely a directory, bail.
     let child_filetype: DirEntryType = match fs.read_inode_verified(child_ino) {
-        Ok((child_inode, _)) => {
-            let mode_bits = child_inode.mode & crate::inode::S_IFMT;
-            match mode_bits {
-                crate::inode::S_IFREG => DirEntryType::RegFile,
-                crate::inode::S_IFDIR => return Ok(()),
-                crate::inode::S_IFLNK => DirEntryType::Symlink,
-                crate::inode::S_IFBLK => DirEntryType::BlockDev,
-                crate::inode::S_IFCHR => DirEntryType::CharDev,
-                crate::inode::S_IFIFO => DirEntryType::Fifo,
-                crate::inode::S_IFSOCK => DirEntryType::Socket,
-                _ => return Ok(()),
-            }
-        }
+        Ok((child_inode, _)) => match DirEntryType::from_mode(child_inode.mode) {
+            DirEntryType::Directory | DirEntryType::Unknown => return Ok(()),
+            t => t,
+        },
         Err(_) => return Ok(()),
     };
 
@@ -1300,13 +1640,14 @@ fn repair_bogus_entry(
             off += rec_len;
         }
         if let Some(off) = hit_off {
+            if !may_restamp(fs, parent_ino, &parent_inode, logical, block) {
+                // Its checksum fails and repair declined to fix it (#344).
+                return Ok(());
+            }
             block[off + 7] = child_filetype as u8;
             if fs.csum.enabled && reserved_tail == 12 {
-                let end = block.len();
-                let mut c = crate::checksum::linux_crc32c(fs.csum.seed, &parent_ino.to_le_bytes());
-                c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-                c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                fs.csum
+                    .patch_dir_entry_tail(parent_ino, parent_inode.generation, block);
             }
             found = true;
             break;
@@ -1317,6 +1658,47 @@ fn repair_bogus_entry(
         fs.commit_block_buffer(buf)?;
         report.repaired_count += 1;
     }
+    Ok(())
+}
+
+/// Repair a `DirBlockChecksumMismatch` finding, as e2fsck does for a block
+/// that "passes checks but fails checksum": recompute the dirent tail's
+/// checksum over the block as it stands.
+///
+/// Only a linear block that passes the structural checks. A block that
+/// does not is one e2fsck salvages entry by entry, and an htree index is
+/// one it rebuilds; neither is done here, so both stay reported, and every
+/// other repair refuses to restamp them (`may_restamp`).
+fn repair_dir_block_checksum(
+    fs: &Filesystem,
+    dir_ino: u32,
+    logical: u64,
+    htree: bool,
+    report: &mut AuditReport,
+) -> Result<()> {
+    if htree {
+        return Ok(());
+    }
+    let (dir_inode, _raw) = fs.read_inode_verified(dir_ino)?;
+    if !dir_inode.is_dir() {
+        return Ok(());
+    }
+    let Some(phys) = fs.map_inode_logical(&dir_inode, logical)? else {
+        return Ok(());
+    };
+    let has_ft = fs.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
+    let mut buf = BlockBuffer::new(fs.sb.block_size());
+    let block = buf.get_mut(fs, phys)?;
+    if dir_block_checksum(fs, dir_ino, &dir_inode, logical, block)
+        != (DirBlockChecksum::Mismatch { htree: false })
+        || !dir_block_passes_checks(block, has_ft)
+    {
+        return Ok(());
+    }
+    fs.csum
+        .patch_dir_entry_tail(dir_ino, dir_inode.generation, block);
+    fs.commit_block_buffer(buf)?;
+    report.repaired_count += 1;
     Ok(())
 }
 
@@ -1396,12 +1778,7 @@ fn finalize_and_commit_inode(
     raw: &mut [u8],
 ) -> Result<()> {
     if fs.csum.enabled {
-        if let Some((lo, hi)) = fs.csum.compute_inode_checksum(ino, generation, raw) {
-            raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-            if raw.len() >= 0x84 {
-                raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-            }
-        }
+        fs.csum.patch_inode_checksum(ino, generation, raw);
     }
     let mut buf = BlockBuffer::new(fs.sb.block_size());
     fs.buffer_write_inode(&mut buf, ino, raw)?;

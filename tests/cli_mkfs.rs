@@ -1,0 +1,285 @@
+//! `mkfs.ext4` as the multi-call binary runs it: the behaviour the
+//! `mkfs_ext4` target had, kept (the checks from tests/mkfs_bin_smoke.rs,
+//! run under the dotted name), and the JSON report it gained.
+//!
+//! No fixture, no VM: the volume is read back with this crate's reader.
+//! What e2fsprogs makes of the same output is tests/cli_mkfs_oracle.rs.
+
+mod cli_support;
+
+use cli_support::*;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::fs::Filesystem;
+use std::{io::Write, sync::Arc};
+
+const SIZE: u64 = 32 << 20;
+
+/// The image still holds exactly `pattern`: same length and same bytes, compared in bounded chunks.
+fn assert_image_unchanged(img: &str, pattern: &[u8], context: &str) {
+    let length = std::fs::metadata(img).unwrap().len();
+    assert_eq!(length, pattern.len() as u64, "{context}");
+    assert_eq!(
+        fs_ext4_test_support::first_different_offset_from_bytes(pattern, img).unwrap(),
+        None,
+        "{context}"
+    );
+}
+
+const UUID: &str = "deadbeef-cafe-1234-5678-0123456789ab";
+
+fn mount(path: &str) -> Filesystem {
+    let dev = FileDevice::open(path).expect("open image");
+    Filesystem::mount(Arc::new(dev)).expect("mount")
+}
+
+fn write_repeated(path: &str, byte: u8, length: u64) {
+    let mut file = std::fs::File::create(path).expect("create patterned file");
+    let chunk = vec![byte; 1024 * 1024];
+    let mut remaining = length;
+    while remaining > 0 {
+        let count = remaining.min(chunk.len() as u64) as usize;
+        file.write_all(&chunk[..count]).expect("write pattern");
+        remaining -= count as u64;
+    }
+}
+
+#[test]
+fn formats_a_pre_sized_file_and_reports_what_the_superblock_says() {
+    let img = sized_image("presized", SIZE);
+    let out = ok(tool("mkfs.ext4").args(["-L", "BINSMOKE", "-U", UUID, &img]));
+    let json = stdout(&out);
+    assert_eq!(json_field(&json, "fs"), "ext4");
+    assert_eq!(json_field(&json, "formatted"), "true");
+    assert_eq!(json_field(&json, "label"), "BINSMOKE");
+    assert_eq!(json_field(&json, "uuid"), UUID);
+
+    let fs = mount(&img);
+    assert_eq!(fs.sb.volume_name, "BINSMOKE");
+    assert_eq!(
+        json_field(&json, "block_size"),
+        fs.sb.block_size().to_string()
+    );
+    assert_eq!(
+        json_field(&json, "total_blocks"),
+        fs.sb.blocks_count.to_string()
+    );
+    assert_eq!(
+        json_field(&json, "free_blocks"),
+        fs.sb.free_blocks_count.to_string()
+    );
+    assert_eq!(
+        json_field(&json, "total_bytes"),
+        (fs.sb.blocks_count * u64::from(fs.sb.block_size())).to_string()
+    );
+    // Progress is still on stderr.
+    assert!(
+        stderr(&out).contains("formatted successfully"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn text_prints_nothing_on_stdout_as_the_tool_always_did() {
+    let img = sized_image("text", SIZE);
+    let out = ok(tool("mkfs.ext4").args(["--text", &img]));
+    assert!(out.stdout.is_empty(), "{}", stdout(&out));
+}
+
+#[test]
+fn size_creates_then_formats_and_create_size_is_its_alias() {
+    for flag in ["--size", "--create-size"] {
+        let img = image_path("size");
+        ok(tool("mkfs.ext4").args([flag, "32M", "-L", "SZ", &img]));
+        assert_eq!(std::fs::metadata(&img).unwrap().len(), SIZE, "{flag}");
+        assert_eq!(mount(&img).sb.volume_name, "SZ", "{flag}");
+    }
+}
+
+#[test]
+fn size_is_idempotent_on_an_existing_file() {
+    let img = sized_image("idem", SIZE);
+    let out = ok(tool("mkfs.ext4").args(["--size", "64M", &img]));
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), SIZE);
+    assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
+}
+
+#[test]
+fn dry_run_does_not_modify_the_file() {
+    let img = image_path("dry");
+    write_repeated(&img, 0xA5, SIZE);
+    let before = fs_ext4_test_support::snapshot_file(&img).unwrap();
+    let out = ok(tool("mkfs.ext4").args(["-n", &img]));
+    fs_ext4_test_support::assert_files_equal(&img, &before);
+    assert_eq!(json_field(&stdout(&out), "formatted"), "false");
+    assert_eq!(json_field(&stdout(&out), "dry_run"), "true");
+}
+
+#[test]
+fn dry_run_with_size_does_not_create_a_missing_target() {
+    let img = image_path("drysize");
+    let out = ok(tool("mkfs.ext4").args(["-n", "--size", "32M", &img]));
+    assert!(std::fs::metadata(&img).is_err(), "a dry run created {img}");
+    let json = stdout(&out);
+    assert_eq!(json_field(&json, "formatted"), "false");
+    assert_eq!(json_field(&json, "dry_run"), "true");
+    assert_eq!(json_field(&json, "device_bytes"), SIZE.to_string());
+}
+
+#[test]
+fn dash_c_does_not_swallow_the_device_path() {
+    let img = sized_image("dashc", SIZE);
+    let out = ok(tool("mkfs.ext4").args(["-n", "-c", &img]));
+    assert!(
+        stderr(&out).contains("-c not yet honored"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_bad_block_size_is_refused_before_the_device_is_opened() {
+    let img = image_path("badbs");
+    write_repeated(&img, 0xAA, SIZE);
+    let before = fs_ext4_test_support::snapshot_file(&img).unwrap();
+    let out = tool("mkfs.ext4")
+        .args(["-b", "3000", &img])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("block size must be a power of two"), "{err}");
+    assert!(!err.contains("formatting"), "{err}");
+    fs_ext4_test_support::assert_files_equal(&img, &before);
+}
+
+#[test]
+fn a_non_ascii_uuid_is_a_usage_error_not_a_panic() {
+    // 32 bytes, so the length check passes, with a two-byte character
+    // straddling the first hex pair.
+    let uuid = format!("a\u{e9}{}", "0".repeat(29));
+    assert_eq!(uuid.len(), 32);
+    let img = sized_image("uuid-utf8", SIZE);
+    let out = tool("mkfs.ext4")
+        .args(["-n", "-U", &uuid, &img])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("panicked"), "{}", stderr(&out));
+}
+
+#[test]
+fn quiet_silences_warnings_from_either_side() {
+    let img = sized_image("quiet", SIZE);
+    let run = |args: &[&str]| stderr(&ok(tool("mkfs.ext4").args(args)));
+    let first = run(&["-n", "-q", "-m", "1", &img]);
+    let last = run(&["-n", "-m", "1", "-q", &img]);
+    assert_eq!(first, last);
+    assert!(first.is_empty(), "{first}");
+    assert!(run(&["-n", "-m", "1", &img]).contains("-m 1 not yet honored"));
+}
+
+#[test]
+fn a_block_device_is_refused_by_size() {
+    // /dev/null is a character device on every Unix: "make me a file" must
+    // not be applied to it.
+    let out = tool("mkfs.ext4")
+        .args(["--size", "1M", "/dev/null"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("refuses to apply"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// `-N` / `--inodes` sets the inode count, as for mke2fs: 1000 inodes on
+/// one group of 256-byte inodes in 4 KiB blocks is rounded up to a whole
+/// table block, 1008. It was accepted and ignored, with a warning.
+#[test]
+fn dash_n_sets_the_inode_count() {
+    for flag in ["-N", "--inodes"] {
+        let img = sized_image(&format!("inodes{flag}"), SIZE);
+        let out = ok(tool("mkfs.ext4").args([flag, "1000", &img]));
+        assert!(
+            !stderr(&out).contains("not yet honored"),
+            "{flag}: {}",
+            stderr(&out)
+        );
+        assert_eq!(json_field(&stdout(&out), "total_inodes"), "1008", "{flag}");
+        let fs = mount(&img);
+        assert_eq!(fs.sb.inodes_count, 1008, "{flag}");
+        assert_eq!(fs.sb.inodes_per_group, 1008, "{flag}");
+    }
+}
+
+#[test]
+fn a_bad_inode_count_is_a_usage_error_before_the_device_is_opened() {
+    for bad in ["0", "-5", "lots", "4294967296"] {
+        let img = image_path(&format!("badinodes{bad}"));
+        let pattern = vec![0xAAu8; SIZE as usize];
+        std::fs::write(&img, &pattern).unwrap();
+        let out = tool("mkfs.ext4").args(["-N", bad, &img]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{bad}: {}", stderr(&out));
+        assert!(
+            !stderr(&out).contains("formatting"),
+            "{bad}: {}",
+            stderr(&out)
+        );
+        assert_image_unchanged(&img, &pattern, "{bad}");
+    }
+}
+
+#[test]
+fn an_inode_count_the_layout_cannot_hold_is_refused_and_writes_nothing() {
+    // One 4 KiB group's bitmap block covers 32768 inodes.
+    let img = image_path("toomanyinodes");
+    let pattern = vec![0xAAu8; SIZE as usize];
+    std::fs::write(&img, &pattern).unwrap();
+    let out = tool("mkfs.ext4")
+        .args(["-N", "40000", &img])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_image_unchanged(&img, &pattern, "");
+}
+
+/// `-i` / `--bytes-per-inode` sets the ratio, as for mke2fs: 32 MiB at one
+/// inode per 64 KiB is 512 inodes. It was accepted and ignored, with a
+/// warning. `-N` takes precedence over it.
+#[test]
+fn dash_i_sets_the_bytes_per_inode() {
+    for flag in ["-i", "--bytes-per-inode"] {
+        let img = sized_image(&format!("ratio{flag}"), SIZE);
+        let out = ok(tool("mkfs.ext4").args([flag, "65536", &img]));
+        assert!(
+            !stderr(&out).contains("not yet honored"),
+            "{flag}: {}",
+            stderr(&out)
+        );
+        assert_eq!(json_field(&stdout(&out), "total_inodes"), "512", "{flag}");
+        assert_eq!(mount(&img).sb.inodes_count, 512, "{flag}");
+    }
+    let img = sized_image("ratio-and-count", SIZE);
+    let out = ok(tool("mkfs.ext4").args(["-i", "65536", "-N", "1000", &img]));
+    assert_eq!(json_field(&stdout(&out), "total_inodes"), "1008");
+}
+
+#[test]
+fn a_bad_bytes_per_inode_is_a_usage_error_before_the_device_is_opened() {
+    for bad in ["0", "1023", "67108865", "lots"] {
+        let img = image_path(&format!("badratio{bad}"));
+        let pattern = vec![0xAAu8; SIZE as usize];
+        std::fs::write(&img, &pattern).unwrap();
+        let out = tool("mkfs.ext4").args(["-i", bad, &img]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{bad}: {}", stderr(&out));
+        assert!(
+            !stderr(&out).contains("formatting"),
+            "{bad}: {}",
+            stderr(&out)
+        );
+        assert_image_unchanged(&img, &pattern, bad);
+    }
+}

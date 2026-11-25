@@ -1,34 +1,456 @@
 # Working in rust-fs-ext4 (agent guide)
 
-Pure-Rust ext2/3/4 driver (`fs-ext4`) exposing a C ABI (`fs_ext4_*`), consumed
-by the DiskJockey FSKit extension. This file is the fast path for an agent
-adding or fixing functionality, so you don't re-derive the workflow each time.
-It points at the existing docs rather than duplicating them:
+Pure-Rust ext2/3/4 driver (`fs-ext4`) exposing a C ABI (`fs_ext4_*`), validated
+against e2fsprogs and the in-kernel ext4 driver, both inside the harness VM.
+This file is the fast path for an agent picking up work here, so the workflow
+does not have to be re-derived each time. It points at the existing docs rather
+than duplicating them:
 
 - **README** → `## Test contract` (suite shape), `## Building`, `### Testing`.
-- **docs/TEST-DISKS.md** → the `test-disks/*.img` fixtures + their `.meta.txt`.
+- **docs/TEST-DISKS.md** → the `test-disks/*.img` fixtures and their `.meta.txt`.
+- **`chores.yml`** → every task named below, and what each one actually runs.
+
+The section between the BEGIN/END markers below is **shared, byte-identical,
+with every repository in this family**. Do not edit it here: change the
+canonical copy and propagate it, or `scripts/agents-core-check.sh` will fail.
+Everything after the END marker is specific to this repository.
+
+<!-- BEGIN SHARED BLOCK: agent-core v10 sha256:8defd170502f598507b5d7174acef1243c442fc67134a03812a2a1e81bc7e63e -->
+## Claiming work
+
+Several agents work these repositories at the same time. Before you start on
+an issue, claim it, so nobody else spends a session on what you are already
+doing. The lock is a **GitHub label**, because labels are shared state that
+every agent can read and change without posting comments into the thread.
+
+**Before starting.** Check, claim, then read back:
+
+```sh
+gh issue view <N> --json labels                      # holds `claimed`? pick another
+gh issue edit <N> --add-label claimed --add-label claim/<session>
+gh issue view <N> --json labels                      # read back and confirm
+```
+
+`<session>` is your session name — `agent-<random4>-<isodate>`, e.g.
+`agent-3f7c-2026-09-22`. Create the `claim/<session>` label if it does not
+exist.
+
+**Resolving a race.** Adding a label is not compare-and-swap: two agents can
+both add `claimed` and both believe they won. That is what the read-back is
+for. If it shows more than one `claim/*` label, the **lexically lowest**
+session keeps the issue; every other agent removes its own `claim/*` label and
+picks different work. Each racer computes the same answer independently, so no
+further coordination is needed.
+
+**When you finish or stop.** Remove both labels — on merge, or the moment you
+abandon the work:
+
+```sh
+gh issue edit <N> --remove-label claimed --remove-label claim/<session>
+```
+
+Delete your `claim/<session>` label from the repository at the end of your
+session so they do not accumulate.
+
+**Reclaiming a stale claim.** An agent that dies holding a claim would block an
+issue forever. If `claimed` was applied more than 12 hours ago and the holder's
+branch has no commits since, any agent may take it: remove the stale `claim/*`,
+add your own, and say so in the issue.
+
+**This is a convention, not a fence.** Nothing enforces it. An agent that
+ignores it duplicates work; it cannot corrupt anything. Honour it anyway.
+
+## Findings become issues before a tracking issue closes
+
+A review, an investigation, or the work under an umbrella issue turns up
+things beyond what it set out to do. File each finding as its own issue --
+what was seen, where, and what would show it fixed -- and cite it in the
+tracking issue **before** that issue closes. A finding left in a comment, a
+pull request description or a transcript is lost when the issue that held
+it closes; an open issue is where the next agent looks.
+
+## Work in a worktree
+
+Every working copy is a **git worktree** of an existing checkout, made with
+`git worktree add`. Never `git clone` a second, unlinked copy — not for a
+branch, a PR, a review, or a sibling you need at another ref:
+
+```sh
+git -C <checkout> fetch origin
+git -C <checkout> worktree add <path> -b <type>/<name> origin/main   # new work
+git -C <checkout> worktree add --detach <path> <tag>                 # a sibling at a pinned ref
+git -C <checkout> worktree remove <path>                             # when done
+```
+
+A worktree shares the checkout's objects and remotes, and `git worktree list`
+shows it to every agent on the machine, so nobody else mistakes it for
+abandoned work or loses track of it. An unlinked clone copies all the history
+again, is invisible to that list, and gets left behind in `/tmp` long after the
+work that made it is merged. Remove your worktree when you finish.
 
 ## Skills to use
 
 - **`dev-loop`** — the required loop for any non-trivial change: baseline the
   full suite → change → re-run (no baseline test may regress) → enhance tests →
   vet. Always run it.
-- **`commit`** / **`pr`** — for grouping commits and opening PRs. Branches are
-  `cth/<name>`; commit subject + flat one-sentence bullets; **no AI attribution**.
-- Discipline for **bug fixes**: **prove it's broken first** (a failing
-  check/test), *then* fix, *then* prove the same check is green, *then* confirm
-  the full baseline still passes. Never write the fix before you have a red.
+- **`commit`** / **`pr`** — for grouping commits and opening pull requests.
+
+Each repository names any further skills of its own below.
+
+## A bug fix starts with a red
+
+**Prove it is broken first** — a failing test — *then* fix it, *then* prove
+that same test is green, *then* confirm the full baseline still passes. Never
+write the fix before you have a red. A fix with no failing test to its name is
+a claim, not a result. The test stays, and guards against the bug returning.
+
+**The pattern never changes. Only where you prove it does.** Prove the red and
+the green in CI, or in the test harness on a local machine when your
+instructions allow it. It is the same test harness and the same tests. Running
+them locally saves pipeline runs when the machine has more power than the CI
+runners. Without such an instruction, use CI.
+
+- Red and green in the harness: push the test and the fix as one commit, and
+  quote the failing output in the pull request, naming the commit it ran on.
+- Red and green in CI: push the test alone, let that run finish, then push the
+  fix to the same branch with the test untouched, and link the run in the pull
+  request.
+- Either way, red and green belong to one pull request on one branch. Never
+  put a fix in a second pull request, stacked or not.
+- A red that fails for another reason proves nothing. Read it.
+
+## Nothing skips
+
+A test that cannot run **fails**, naming the task that would provide what it
+needed. Never add an early return for a missing fixture, tool or VM: a skipped
+test reads exactly like a passing one, and a suite that quietly declines to run
+is indistinguishable from a suite that passes.
+
+Where a tier reports skips or ignored tests, that is a gate, not a note.
+
+## Validate against something that is not us
+
+A driver's own readers share its interpretation of the format, so they cannot
+catch a misreading: the mistake is baked into the fixture *and* the parser, and
+they agree with each other while disagreeing with every real filesystem. Unit
+tests over self-built fixtures prove self-consistency, not correctness.
+
+Every structure that is parsed or written gets a cross-validation test against
+an **independent oracle** — the platform's own tools, a real kernel, or a third
+implementation — before it is considered done. Each repository names its
+oracles below.
+
+## Checks that guard data are never weakened
+
+These drivers read and write real disks, and an application mounts them on
+people's machines. A checker that wrongly calls a damaged volume clean, or a
+test loosened until it passes, hides a defect that can destroy data nobody can
+get back. So, for every agent and every contributor:
+
+- **Never skip, disable, relax, quiet or retarget a test, gate, checker,
+  floor, budget or pass/fail rule to make a run go green.** That includes
+  turning a failure into a warning, narrowing what a gate accepts, dropping a
+  case, lowering an executed-case floor, and raising a budget to hide a
+  regression. A budget may be raised only for a run that passed everything,
+  with the measurement written beside the row.
+- **Never add a baseline line, expected-failure entry or ignore to make a
+  disagreement disappear** unless there is an issue for it *and* evidence of
+  which side is correct. "Probably harmless" is not evidence.
+- **When the driver and an independent oracle disagree,** work out from the
+  on-disk format and the oracle's own behaviour which side is right. If the
+  driver is wrong, fix the driver: the failing test first, then the fix, the
+  test untouched. If the oracle is wrong or the difference is correct, say why
+  with evidence in the issue.
+- **If you cannot tell which side is right, stop and report it as blocked**
+  with what you tried. A blocked item is a good result; a convenient guess is
+  not.
+- **Changing what a gate accepts is the owner's decision,** never an
+  agent's. Propose it in an issue with the numbers and leave it open.
+- A change that touches a gate, a floor, a budget or a baseline says so
+  plainly in its pull request, and names which of these it is.
+
+## Output is budgeted
+
+Test tiers run through `scripts/tier.sh`, which runs the suite **quietly**: the
+whole run goes to `tmp/logs/<tier>.log`, a pass prints one verdict line naming
+that log, and a failure prints the verdict, the command's status and the log's
+path — `--tail N`, or `OUTPUT_BUDGET_FAIL_TAIL=N`, prints the tail for whoever
+is watching. **Read the log**: a failing tier names it and does not recite it.
+CI keeps the logs as an artifact, so the detail is always retrievable.
+
+The budget caps the log, not merely what is shown, and every number in the
+table was measured. A run that passes but prints more than its budget **fails**.
+
+The reader who pays most for a noisy suite is an agent that re-reads its whole
+transcript on every step, and so pays for one loud run many times over. If a
+tier legitimately grows, raise its row **with the measurement that justifies
+it**. Do not silence output to fit, and do not route around `tier.sh`.
+
+## Commits and branches
+
+- Branches are `<type>/<name>`, matching the commit type: `fix/`, `feat/`,
+  `ci/`, `docs/`, `chore/`, `test/`.
+- A commit is a subject plus flat one-sentence bullets. Subjects are
+  declarative, not imperative: "the run-end bound is checked", not "check the
+  run-end bound".
+- **No AI attribution and no co-author trailers**, in commits or in pull
+  request descriptions.
+- `main` takes **squash merges only**.
+- **Bring a branch up to date before every push.** `git fetch origin`, and
+  if its base has moved -- the layer below it in the stack, or `main` at the
+  bottom -- rebase onto the base first, resolving any conflicts then, while
+  they are small. Synced first, the run
+  tests the branch close to how it will land. And a branch synced at every
+  push never goes stale: each sync takes in only what landed since the last
+  one, so conflicts stay few and small. Sync when you are pushing anyway; a
+  push made only to bring a branch up to date buys a whole CI run and
+  nothing else.
+- **`main` merges through a merge queue.** A stack whose pull requests'
+  own CI is green goes into the queue: `gh stack merge <stack> --yes` adds
+  every layer up to the one named. Never queue a stacked pull request with
+  the REST `merge-async` call: it answers "enqueued" and queues nothing. The
+  queue tests each group on a temporary branch, `main` plus the queued pull
+  requests in order, and squash-merges each one only when that run is green,
+  so what lands is exactly the tree CI ran. That run is what "branches must be up to
+  date" used to buy, at one run per group instead of one per pull request per
+  merge: never update a branch only so that it can merge. Every workflow
+  that gates `main` triggers on `merge_group`, or the queue never sees its
+  result and nothing merges.
+
+## One stack per repository
+
+Every repository lands its pull requests as one stack, whether or not they
+touch the same files. Conflicts are then paid for once, when a pull request
+joins the stack, instead of again in the merge queue after every merge.
+
+- **A new pull request goes on the top.** Ask
+  `../rust-fs-core/scripts/stack-base.sh` (run in place; in rust-fs-core
+  itself, `scripts/stack-base.sh`): it prints the head branch of the top of
+  the stack, or `main` when nothing is open. Rebase onto that branch, resolve
+  every conflict locally while you do, and build and lint the result before
+  you push. A merge that is clean on your machine is clean in CI, so a
+  conflict that reaches the queue means the base was stale or the technique
+  was wrong. Then link the pull request into the stack: `gh stack link
+  <stack> <pull request>`.
+- **One squashed commit per layer.** Squash the branch to one commit on the
+  layer below before it joins, so the layers above replay without resolving
+  anything again.
+- **The queue still tests every layer.** It runs the full pipeline on `main`
+  plus each layer and the layers below it, and squash-merges each layer as
+  its own commit, so nothing lands untested and `main` stays bisectable.
+- **A red layer stops the stack.** Fix it in place, on its own branch, then
+  replay every layer above it with `git rebase --update-refs` and push them
+  together. Do not move a red layer to the top: the layers above were
+  resolved against it. Take a layer out only when its fix cannot come soon,
+  and say so on its pull request.
+- **Never delete a branch a pull request is based on.** Deleting it closes
+  every pull request above it, and none can be reopened while it is gone.
+
+## Changelog entries are fragments
+
+A pull request never edits `CHANGELOG.md`. It adds one file under
+`changelog.d/`, named for its branch (`fix/run-end-bound` writes
+`changelog.d/fix-run-end-bound.md`), holding one or more `### Added`,
+`### Changed`, `### Fixed` (or any other) headings, each over `- ` entries.
+Pull requests open at the same time then never conflict over the top of one
+file. A change no consumer would notice -- tests, CI, documentation -- adds
+no fragment.
+
+A release gathers them: `../rust-fs-core/scripts/changelog-gather.sh
+VERSION` writes every fragment into a dated `## [VERSION]` section of
+`CHANGELOG.md` and deletes the fragments, in the release commit. An entry is
+a fragment until it ships and a line of `CHANGELOG.md` after, never both.
+`chore lint` runs `changelog-check.sh`: every fragment is well formed, and
+`CHANGELOG.md` holds no unreleased entries of its own.
+
+## Project rules
+
+- **No GPL/LGPL/AGPL dependencies.** Permissive only (MIT/BSD/Apache).
+  Shelling out to a copyleft CLI as a *test oracle* is fine — linking or
+  copying it is not.
+- **Each of these is a standalone project.** Never mention a consuming
+  application in the README, the source, or CLI help.
+<!-- END SHARED BLOCK: agent-core v10 -->
+
+
+## Keep the features page current
+
+`docs/features.md` lists every feature with its state, the release it
+shipped in, its tracking issue and the test that checks it. **A pull
+request that adds, fixes, refuses or removes behaviour records its row in
+the same pull request** -- as a fragment, never as an edit to the page. A
+finding that leaves something unsupported gets a row too, naming its
+issue.
+
+A pull request adds one file under `features.d/`, named for its branch
+like its changelog fragment (`fix/run-end-bound` writes
+`features.d/fix-run-end-bound.md`), holding one or more `## Section`
+headings of the page, each over rows in that section's columns, with the
+PR number under **Since** (`Unreleased (#N)`). A row whose first cell, the
+Feature, matches an existing row replaces it in place; a new one is
+appended to the section. `remove: KEY` deletes a row and `rename: KEY`
+followed by a row replaces it under a new key, both by the exact Feature
+text. One fragment writes a row: to change a row another unreleased
+fragment writes, edit that fragment. Pull requests open at the same time
+then never conflict over neighbouring rows of one table.
+
+A release applies them: `../rust-fs-core/scripts/features-gather.sh
+VERSION` writes every fragment into the page, turns every `Unreleased`
+into the version, and deletes the fragments, in the release commit.
+`chore lint` runs `features-check.sh`: every fragment applies to the page,
+and the page holds no `Unreleased` row of its own. The convention is
+rust-fs-core's `docs/features-fragments.md`.
+
+## Clean room
+
+This crate is MIT-licensed, and it can only stay that way if nothing in it
+is derived from copyleft source. "No GPL dependencies" above is about
+linking; this is about **reading**. It binds every contributor, human or
+agent, on every task.
+
+**Never open, and never reproduce:**
+
+- **Linux kernel source.** Its ext4, JBD2 and Unicode code, its headers,
+  its library routines (CRCs included), in any form: a checkout, a web
+  viewer, a mirror, a patch on a mailing list, a quote in an issue.
+- **e2fsprogs source.** libext2fs, e2fsck, debugfs, mke2fs, in any form.
+  The *tools* are fine; their source is not.
+- **The previous, non-clean implementations in this repository.** Code
+  replaced because a provenance audit found it derived, or too close to be
+  sure of, is off limits in its old form: the htree name hashes in
+  `src/hash.rs` from before their clean-room rewrite, and the routines
+  restated alongside them. Not in git history, not in another checkout,
+  not in a published crate.
+- **Your own memory of any of the above.** A model has read the kernel.
+  Recalling a routine's shape or its name and writing it down is copying
+  with extra steps. If you notice you are about to, stop, and derive the
+  answer from the sources below instead.
+
+**What you may use:**
+
+- **Public specifications.** The ext4 and JBD2 format documentation as
+  published on docs.kernel.org / kernel.org (the rendered documentation,
+  not the source tree it is built from), the ext4 wiki, RFCs (RFC 1320
+  MD4, RFC 3720 CRC32C), papers (TEA, SipHash) and the Unicode Character
+  Database.
+- **Permissively licensed code** (BSD, MIT, Apache), credited.
+- **Black-box oracles.** Run `mke2fs`, `e2fsck`, `debugfs`, `dumpe2fs`, a
+  real kernel mount and the other oracles below, and compare what they
+  print and the bytes they write. Observing what a tool does is not
+  copying it. Where the documentation is silent, find out this way: have
+  a tool write the structure, read the bytes, and pin what you learned
+  with a test.
+
+**Write down the fact, not whose code does it.** A comment or doc states
+the on-disk rule or the observed behaviour and cites where it comes from:
+the documentation section, or the oracle test that shows it. It never
+names a kernel or e2fsprogs function, an internal macro or a source file,
+and never links into either source tree. "Mirrors the kernel's function
+so-and-so in such-and-such a file" makes code read as derived whether or
+not it is, and sends the next reader to open that file. Names that belong to the documented format are
+fine: `struct ext4_extent_header`, `journal_header_t`, `s_inodes_count`,
+`EXT4_EXTENTS_FL`.
+
+**The check.** `scripts/check-provenance.sh` (`chore check:provenance`,
+run by `chore lint` and by CI's `provenance` job) fails on kernel and
+e2fsprogs source paths and links, on kernel and e2fsck function names,
+kernel-internal macros and e2fsck problem codes anywhere in the tracked
+tree, file names included, and on C written out in a comment or a doc. A
+documented format name it flags goes into the script's allowlist with the
+reason; nothing else does, and an entry nothing uses fails the check. It
+is a denylist: passing it is necessary, not sufficient.
+
 
 ## Running tests
 
+The tasks are the interface; CI runs exactly these (`chores.yml` has the
+contract at its top):
+
 ```sh
-cargo test                  # full suite (lib + integration). ~700 tests.
-cargo test --test <name>    # one integration binary, e.g. repro_wants_dir_symlinks
-cargo clippy --all-targets -- -D warnings   # what the pre-commit hook runs
+chore siblings        # ../rust-fs-core and ../fs-linux-test-harness at their pinned refs
+chore tools           # what the HOST needs: ripgrep, and the VM (Vagrant/QEMU/KVM)
+chore fixtures        # build test-disks/*.img in the fs-linux-test-harness VM
+chore test:unit       # no tools, no fixtures, no VM (debug; traps overflows)
+chore test:images     # reads a fixture, needs no VM
+chore test:oracle     # e2fsck / debugfs / mke2fs — run INSIDE the VM
+chore test:kernel     # the real kernel loop-mounts our images and reads them back
+chore test:lwext4     # lwext4, a third implementation, built in the VM — both ways
+chore test:wasm       # the browser build (wasm32), run under Node (`chore tools:wasm` first)
+chore test:vm         # the whole suite, compiled and run INSIDE the VM
+chore test            # everything, as CI runs it
+chore lint            # fmt + clippy -D warnings
+
+./scripts/test.sh --test <name>   # one integration binary, e.g. repro_wants_dir_symlinks
 ```
 
-Install the hooks once per clone: `./scripts/install-hooks.sh` (runs
-`cargo fmt --check` + `cargo clippy -D warnings` on every commit).
+**The oracle tools are never run on the host.** Not on a Mac, not on
+Linux, not even where they are installed. e2fsprogs on a workstation is
+whatever that machine has, and an oracle whose answer depends on the
+machine is not an oracle — so they live in one Debian guest
+(`scripts/vm-setup.sh` installs them) and `fs_ext4_test_support::oracle`
+is the only way in. `tests/test_contract.rs` fails the suite if a test
+spawns one itself, drives the VM itself, or mounts anything on the host.
+The VM boots once per run (the first oracle call), every later call rides
+one shared SSH connection (~0.1 s per tool invocation), and
+`scripts/test.sh` runs the suite inside a harness session (`vm.sh
+session`), so the run is one session on the shared guest, which ends with the
+run however it was started and leaves the guest up for the next one.
+
+**We run the Linux tests on Linux.** On a Linux host `chore test` runs
+them here; on macOS it runs `chore test:vm`, which builds and runs the
+same sources inside the guest (the harness mounts the repository there at
+the path the host knows it by). Nothing Linux-shaped runs natively on a
+Mac.
+
+**Nothing skips.** A test that needs a fixture gets it from
+`fs_ext4_test_support::fixture`, one that needs a tool from `oracle` /
+`assert_e2fsck_clean`, one that needs the kernel from the guest-kernel
+helpers; all of them fail, naming the task that provides it, when it is
+missing. Never add an early return for a missing image, tool or VM: a
+skipped test reads exactly like a passing one.
+`scripts/test-targets.sh` derives the tiers from those calls; a library
+test that needs a fixture or the VM goes in a `needs_host` module so
+`chore test:unit` can leave it to `chore test`.
+
+Use `scripts/test.sh` for local runs: it gives every run its own scratch
+directory and cleans it afterward. **That directory is inside the
+repository** (`./tmp`, gitignored) on every machine, because the guest
+sees this repository and nothing else of the host — an image under `/tmp`
+or `$RUNNER_TEMP` would not exist for the tool asked to read it.
+`FS_EXT4_TEST_TMPDIR` names an exact directory instead, and is refused if
+it is outside the repository.
+
+Install the hooks once per clone with github-guard's installer:
+`~/.claude/skills/github-guard/install.sh .` (formats with `cargo fmt` and runs
+`cargo clippy --all-targets -- -D warnings` on every commit).
+
+
+## What gates a merge
+
+**One required check, and it is `ci-ok`.** Branch protection on `main`
+requires that context and nothing else:
+
+```sh
+gh api repos/antimatter-studios/rust-fs-ext4/branches/main/protection/required_status_checks
+# {"strict":true,"contexts":["ci-ok"], ...}
+```
+
+`ci-ok` in `ci.yml` `needs:` every other job and fails when any of them
+failed, was cancelled **or was skipped**, so a job that is renamed,
+split or dropped turns the gate red in the same diff that does it. That
+is the point of naming one: the list in a settings page nobody re-reads
+cannot drift away from the workflow.
+
+Do not add job names to the required list. A required context nothing
+reports reads as "Expected — waiting for status to be reported" for
+ever, which blocks every pull request while telling nobody why — this
+repository sat that way with three stale names (#263), one of them from
+a workflow that no longer existed.
+
+Nothing in the tree can check this: protection is not a file. If a
+merge is blocked with every check green, read the required contexts
+first.
+
 
 ## Adding a test (the in-tree pattern)
 
@@ -38,7 +460,7 @@ read-only and assert. Canonical templates:
 `tests/repro_wants_dir_symlinks.rs`.
 
 ```rust
-let path = copy_to_tmp("ext4-csum-seed.img", "tag");      // fixture → unique /tmp copy
+let path = copy_to_tmp("ext4-csum-seed.img", "tag"); // fixture → unique scratch copy
 {
     let dev = FileDevice::open_rw(&path)?;
     let fs = Filesystem::mount(Arc::new(dev))?;           // replays journal if dirty
@@ -56,48 +478,67 @@ A bad-but-marked-clean checksum passes it. For checksum bugs, either recompute
 the specific checksum in-process (jsb example above) or cross-check with a real
 ext4 (below).
 
-## Cross-validation: the real-ext4 oracle (use this for checksum/layout bugs)
+
+## The oracles: e2fsprogs and the kernel, both in the harness VM
 
 The driver shares this crate's spec interpretation, so its own
 `verify::verify` / `fsck::audit` (structural: link counts, dirents, free-count
-drift) **cannot** catch metadata_csum / journal-checksum / `itable_unused` bugs.
-A **real Linux `e2fsck`** can. The repo's verification options:
+drift) **cannot** catch metadata_csum / journal-checksum / `itable_unused` bugs,
+and no reader of ours can prove the bytes it wrote are the bytes on disk.
+Independent tools can:
 
-- **Alpine QEMU VM** (`test-disks/build-ext4-feature-images.sh`, `_vm-builder.sh`,
-  cached under `.vm-cache/`) — real Linux `mke2fs` + `e2fsprogs`. **This is the
-  oracle.** It builds the fixtures and can `e2fsck` any image. No host
-  `e2fsprogs` needed; no Docker.
-- `scripts/cross-validate-lwext4.sh` + `tests/lwext4_cross_validate.rs` —
-  independent C impl, opt-in (`LWEXT4_DIR`); currently a **read-only skeleton**.
-- `tests/{qemu,vagrant}/freebsd/` — a real kernel, but FreeBSD's ext4 validates
-  JBD2 differently from Linux; not pre-built.
+- **`e2fsck -fn`** — consistency. `assert_e2fsck_clean(image, tag)` in the
+  test support crate. **Exit `0` is not "clean"**: `-n` exits 0 having
+  answered "no" to `Free blocks count wrong`, having skipped the replay of a
+  journal it then graded, and (without `-f`) having run no pass at all. Every
+  report is read by `fs_ext4_test_support::verdict` into `Clean`, `Findings`
+  or `NotAVerdict`, and only `Clean` passes; `oracle("e2fsck")` is reachable
+  only through `.judged()` (#280). `tests/oracle_verdicts.rs` holds the reader
+  to reports captured from the tools in the guest, and
+  `tests/oracle_verdicts_live.rs` to the tools themselves.
+- **`debugfs`** — content and metadata: `dump` + compare, `stat`, `ex`,
+  `icheck`, `ncheck`, `logdump`. `tests/oracle_debugfs.rs` is the template,
+  including the negative case that proves why both are needed (a flipped
+  data byte passes e2fsck and fails the dump comparison).
+  Both are reached through `fs_ext4_test_support::oracle(tool)`, which runs
+  them in the guest and returns the tool's own `Output` — same exit status,
+  same streams, no host path to fall back to. debugfs exits 0 on a request it
+  could not carry out, so a `debugfs`, `dumpe2fs` or lwext4 call whose report
+  is not a verdict fails where it was made.
+- **The kernel itself**, through `guest_kernel_report` /
+  `guest_kernel_write` in the test support crate: our image is loop-mounted
+  in the guest and a script walks it, hashes every file and reads xattrs
+  and ACLs back in ONE guest call. `tests/kernel_readback.rs` (Rust API),
+  `tests/kernel_readback_capi.rs` (C ABI). This is what catches what
+  `e2fsck` cannot — an ACL blob with the wrong version, an extent the
+  kernel maps shorter than we wrote it — and it is the only place a
+  filesystem is mounted at all.
+- **The fixtures** are kernel-made the same way: `chore fixtures` runs
+  `test-disks/guest-build-images.sh` as root in the guest (loop mounts,
+  xattrs, ACLs, inline data, htree directories) through the
+  [fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness)
+  VM, whose tooling `scripts/vm-setup.sh` installs. For anything else in
+  the guest: `chore vm:run -- <command>`, `chore vm:exec -- <command>` (the
+  fast path, for a VM that is already up), `chore vm:put <file>` (lands in
+  `/share`), `chore vm:down` (stops it only when nobody is using it). Every repository on
+  the machine uses one shared guest; `FLTH_SHARED_ROOT` defaults to the
+  directory holding the main checkout, so it is not set.
+- `tests/lwext4_cross_validate.rs` + `tests/lwext4/report.c` — A THIRD
+  IMPLEMENTATION. lwext4 (BSD-2-Clause, pure C) is built in the same guest
+  by `scripts/vm-setup.sh` at a pinned commit, and the two read each
+  other's images: every fixture it can mount, a tree this crate wrote, and
+  a tree it wrote itself. `chore test:lwext4`.
 
-### Recipe: `e2fsck` a driver-mutated image in the Alpine VM
-
-`scripts/vm-e2fsck.sh <image>...` does this end-to-end. The mechanics + the
-traps that cost time:
+To check a driver-mutated image by hand, ask the guest — the tools are
+there, and it sees this repository at the same path the host does:
 
 ```sh
-# boot (server mode): SSH on localhost:2222, key .vm-cache/builder-key,
-# the dir in HOST_IMAGE_DIR is 9p-shared at /host inside the VM.
-HOST_IMAGE_DIR=/path/to/dir bash test-disks/build-ext4-feature-images.sh --server > boot.log 2>&1
-source test-disks/.vm-cache/server.env   # EXT4_BUILDER_PORT / _KEY / _PID
-ssh -i "$EXT4_BUILDER_KEY" -p "$EXT4_BUILDER_PORT" -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes \
-    -o ServerAliveInterval=5 -o ServerAliveCountMax=2 root@localhost \
-    'e2fsck -fn /host/<image>' </dev/null
-kill "$EXT4_BUILDER_PID"                  # teardown
+chore vm:up                                   # boot and hold it
+chore vm:run -- e2fsck -fn "$PWD/tmp/x.img"
+chore vm:run -- debugfs -R "'stat /path'" "$PWD/tmp/x.img"
+chore vm:down
 ```
 
-Traps (all hit during the metadata_csum fix series):
-- **Do NOT pipe the boot script through `tail`/`head`** — qemu inherits its
-  stdout, so the pipe reader never sees EOF and hangs. Redirect to a file.
-- The shell here is **zsh**: `$SSH` as a string does **not** word-split — call
-  `ssh` directly with an args array, or it becomes one "command not found" arg.
-- Wrap each ssh in `timeout` + use `ServerAlive*`: `ConnectTimeout` bounds only
-  the TCP connect, not a post-connect stall.
-- e2fsck exit: `0` clean, `4` errors-left-uncorrected, `8` op error, `12`
-  "cannot proceed" (e.g. corrupt journal superblock).
 
 ## Build environment
 
@@ -107,12 +548,13 @@ Traps (all hit during the metadata_csum fix series):
 - Toolchain is pinned (`rust-toolchain.toml`); the hook enforces
   `clippy -D warnings` (e.g. `manual_div_ceil` → use `.div_ceil(n)`).
 
+
 ## Worked example: the metadata_csum write-path fixes
 
 A real bug surfaced from the field (a Bookworm SD card whose journal the kernel
 rejected after a write). Reproduced with `tests/repro_wants_dir_symlinks.rs` on
 `ext4-csum-seed.img`, then fixed as a stack, each step proven red→green with
-the Alpine-VM `e2fsck` and the full baseline:
+a real `e2fsck` and the full baseline:
 
 1. **jbd2 superblock checksum** not recomputed in `journal_writer::write_jsb`.
 2. **`bg_itable_unused`** not maintained on inode alloc (`buffer_mark_inode_used`).
@@ -124,3 +566,38 @@ the Alpine-VM `e2fsck` and the full baseline:
 The pattern to copy: `metadata_csum` writes must recompute **every** affected
 checksum (superblock, group descriptor, bitmaps, inode, journal) — and the only
 reliable proof is a real `e2fsck`, not the driver's own readers.
+
+## The gate is a script, not a test
+
+`chore check:ci-gate` holds both halves of the aggregate mechanically — every
+job in `ci.yml` must appear in `ci-ok`'s `needs:`, and `.github-guard` must
+require `ci-ok` and nothing else. The task runs `../rust-fs-core/scripts/ci-gate.sh` and
+nothing else, so the script is what can be tested, reviewed and run without
+`chore` at all.
+
+It replaced `tests/ci_aggregate_gate.rs`, which was the wrong container twice
+over: it parsed a YAML file and compared strings, exercising nothing this crate
+ships, and as a `cargo test` it counted towards the **executed-test floor the
+gate itself enforces** — so the suite could satisfy its own floor partly by
+checking its own CI config.
+
+Judging mergeability from check **conclusions** is unreliable: an in-progress
+`CheckRun` reports its conclusion as an empty string, and a `StatusContext` has
+no conclusion field at all. Read `mergeStateStatus` and
+`statusCheckRollup.state`.
+
+## Never grow a shared tool to solve a problem in this repository
+
+`chore` is a general-purpose task runner this project merely consumes; the same
+goes for `github-guard` and the agent-skills hooks. If something needed here
+looks like it belongs inside one of them, it does not. Solve it here, or ask
+first. The tell is a release: if a shared tool needs a new version cut whose
+only purpose is to unblock this project, the code is in the wrong repository.
+
+## The shared block above is checked
+
+`scripts/agents-core-check.sh` hashes the content between the BEGIN/END markers
+and compares it against the canonical digest. Editing the block here fails that
+check rather than quietly giving this repository its own rules. When the block
+genuinely changes it changes everywhere: edit the canonical copy, then update
+the digest in the script and in the BEGIN marker of every repository.

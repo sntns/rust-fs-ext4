@@ -63,7 +63,7 @@ fn scratch_path(stem: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("rust-fs-ext4-{stem}-{pid}-{nanos}.img"))
+    fs_ext4_test_support::temp_dir().join(format!("rust-fs-ext4-{stem}-{pid}-{nanos}.img"))
 }
 
 #[test]
@@ -114,10 +114,11 @@ fn mkfs_ext2_then_mount_and_read_root() {
     );
 
     // Parse the entries and assert `.` + `..` are present and both point at
-    // the root inode itself.
+    // the root inode itself, and `lost+found` at inode 11 (#443).
     let entries = dir::parse_block(&dir_data, true).expect("parse dir entries");
     let mut saw_dot = false;
     let mut saw_dotdot = false;
+    let mut saw_lost_found = false;
     for e in &entries {
         let name = std::str::from_utf8(&e.name).unwrap_or("<bad utf8>");
         match name {
@@ -129,10 +130,17 @@ fn mkfs_ext2_then_mount_and_read_root() {
                 saw_dotdot = true;
                 assert_eq!(e.inode, ROOT_INODE, ".. of root must point at root");
             }
+            "lost+found" => {
+                saw_lost_found = true;
+                assert_eq!(e.inode, 11, "lost+found is inode 11");
+            }
             other => panic!("unexpected entry in fresh root dir: {other:?}"),
         }
     }
-    assert!(saw_dot && saw_dotdot, "root must contain `.` and `..`");
+    assert!(
+        saw_dot && saw_dotdot && saw_lost_found,
+        "root must contain `.`, `..` and `lost+found`"
+    );
 }
 
 /// Cover the four indirect-tree tiers in one test by stamping payloads that
@@ -358,9 +366,11 @@ fn mkfs_ext3_then_mount_ro_and_read_root() {
     // Inode 8 must be marked allocated and parse as the journal inode.
     let raw = fs.read_inode_raw(8).expect("read journal inode");
     let jinode = Inode::parse(&raw).expect("parse journal inode");
+    // mke2fs writes the journal inode as a regular file, and e2fsck takes one
+    // that is not for no journal at all (#89).
     assert_eq!(
-        jinode.mode, 0,
-        "journal inode i_mode must be 0 (Linux convention)"
+        jinode.mode, 0o100600,
+        "journal inode i_mode must be S_IFREG | 0600, as mke2fs writes it"
     );
     assert_eq!(jinode.links_count, 1);
     assert!(

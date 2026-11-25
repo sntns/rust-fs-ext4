@@ -38,7 +38,7 @@
 //!
 //! Checksums: when `METADATA_CSUM` or `GDT_CSUM` is enabled, each extent block
 //! (i.e. internal-node data, not the inline i_block) has a trailing
-//! `ext4_extent_tail` (4-byte CRC32c). We parse but don't verify in Phase 1.
+//! `ext4_extent_tail` (4-byte CRC32c), verified as each block is read.
 
 use crate::block_io::BlockDevice;
 use crate::checksum::Checksummer;
@@ -271,22 +271,38 @@ pub fn lookup_verified(
         }
 
         // Internal: find the largest index entry whose ei_block <= logical_block.
+        //
+        // OR THE FIRST ONE, when the block is below all of them. That is a
+        // hole in front of the file's first data, and the leaf below the
+        // first index says so by holding no extent that contains it. Refusing
+        // here instead called a sound filesystem corrupt, and made every
+        // sparse file whose data starts past block 0 unreadable at its
+        // leading hole (#260). A block no extent covers is a hole, and
+        // e2fsck accepts such a file (tests/leading_hole_deep_tree.rs), so a
+        // lookup below every index key descends through the first entry and
+        // finds no extent there.
         let mut chosen_idx: Option<ExtentIdx> = None;
+        let mut first_idx: Option<ExtentIdx> = None;
         for i in 0..header.entries {
             let off = EXT4_EXT_NODE_SIZE * (1 + i as usize);
             if off + EXT4_EXT_NODE_SIZE > cursor.len() {
                 return Err(Error::CorruptExtentTree("index entry out of range"));
             }
             let idx = ExtentIdx::parse(&cursor[off..off + EXT4_EXT_NODE_SIZE])?;
+            if first_idx.is_none() {
+                first_idx = Some(idx);
+            }
             if (idx.logical_block as u64) <= logical_block {
                 chosen_idx = Some(idx);
             } else {
                 break;
             }
         }
-        let idx = chosen_idx.ok_or(Error::CorruptExtentTree(
-            "no index entry covers logical block",
-        ))?;
+        // An index node with no entries at all is corrupt: there is nothing
+        // below it to descend into.
+        let idx = chosen_idx
+            .or(first_idx)
+            .ok_or(Error::CorruptExtentTree("index node holds no entries"))?;
 
         // Read the child block, parse its header, continue loop.
         let mut buf = vec![0u8; block_size as usize];
@@ -326,8 +342,44 @@ pub fn collect_all(root: &[u8], dev: &dyn BlockDevice, block_size: u32) -> Resul
         ));
     }
     let mut out = Vec::new();
-    walk(root, &header, dev, block_size, &mut out, header.depth)?;
+    walk(
+        root,
+        &header,
+        dev,
+        block_size,
+        &mut out,
+        &mut Vec::new(),
+        header.depth,
+    )?;
     Ok(out)
+}
+
+/// Every leaf extent, and every block holding a node of the tree below the
+/// inode's inline root: the index and leaf blocks a file owns besides its
+/// data. Freeing a file has to free both.
+pub fn collect_all_with_nodes(
+    root: &[u8],
+    dev: &dyn BlockDevice,
+    block_size: u32,
+) -> Result<(Vec<Extent>, Vec<u64>)> {
+    let header = ExtentHeader::parse(root)?;
+    if header.depth > EXT4_EXT_MAX_DEPTH {
+        return Err(Error::CorruptExtentTree(
+            "extent tree depth exceeds spec maximum",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut nodes = Vec::new();
+    walk(
+        root,
+        &header,
+        dev,
+        block_size,
+        &mut out,
+        &mut nodes,
+        header.depth,
+    )?;
+    Ok((out, nodes))
 }
 
 fn walk(
@@ -336,6 +388,7 @@ fn walk(
     dev: &dyn BlockDevice,
     block_size: u32,
     out: &mut Vec<Extent>,
+    nodes: &mut Vec<u64>,
     descents_remaining: u16,
 ) -> Result<()> {
     if header.is_leaf() {
@@ -369,6 +422,7 @@ fn walk(
                     "extent walk: child block offset overflow",
                 ))?;
         dev.read_at(child_offset, &mut buf)?;
+        nodes.push(idx.leaf_block);
         let child_header = ExtentHeader::parse(&buf)?;
         walk(
             &buf,
@@ -376,6 +430,7 @@ fn walk(
             dev,
             block_size,
             out,
+            nodes,
             descents_remaining - 1,
         )?;
     }
@@ -413,10 +468,6 @@ pub fn map_logical_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_io::FileDevice;
-    use crate::fs::Filesystem;
-    use crate::inode::Inode;
-    use std::sync::Arc;
 
     /// Build a minimal root header + leaf extent buffer inline (fits in 60 bytes).
     fn make_root(ext_count: u16) -> Vec<u8> {
@@ -536,52 +587,6 @@ mod tests {
         ));
     }
 
-    /// Real ext4-basic.img test: the root directory's inode has exactly one
-    /// leaf extent pointing at a single directory block. We verify the extent
-    /// layout and that reading the mapped physical block returns data that
-    /// parses as directory entries.
-    #[test]
-    fn ext4_basic_root_inode_has_extent() {
-        let path = "test-disks/ext4-basic.img";
-        let file = match FileDevice::open(path) {
-            Ok(f) => f,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let dev: Arc<dyn BlockDevice> = Arc::new(file);
-        let fs = Filesystem::mount(dev.clone()).expect("mount");
-        let raw = fs.read_inode_raw(2).expect("root inode"); // inode 2 = root dir
-        let inode = Inode::parse(&raw).expect("parse inode");
-
-        assert!(inode.is_dir(), "root inode is not a directory");
-        assert!(inode.has_extents(), "root inode does not use extents");
-
-        let header = ExtentHeader::parse(&inode.block).expect("parse extent header");
-        assert_eq!(header.magic, EXT4_EXT_MAGIC);
-        assert_eq!(header.depth, 0, "expected a leaf root for tiny test image");
-        assert!(header.entries >= 1);
-
-        let all =
-            collect_all(&inode.block, dev.as_ref(), fs.sb.block_size()).expect("collect extents");
-        assert!(!all.is_empty());
-        // First extent should start at logical block 0 for a small dir.
-        assert_eq!(all[0].logical_block, 0);
-        assert!(!all[0].uninitialized);
-
-        // Read the first physical block and verify it looks like a dir block
-        // (should have '.' as the first entry).
-        let first_phys = all[0].map(0);
-        let mut blk = vec![0u8; fs.sb.block_size() as usize];
-        dev.read_at(first_phys * fs.sb.block_size() as u64, &mut blk)
-            .unwrap();
-
-        let entries = crate::dir::parse_block(&blk, true).expect("parse dir block");
-        assert!(!entries.is_empty());
-        assert_eq!(entries[0].name, b".");
-    }
-
     fn make_extent(logical_block: u32, length: u16, physical_block: u64) -> Extent {
         Extent {
             logical_block,
@@ -667,5 +672,54 @@ mod tests {
         assert_eq!(e.length, 3);
         assert_eq!(e.physical_block, 200);
         assert!(!e.uninitialized);
+    }
+
+    /// Tests that read a fixture from `test-disks/` (`chore fixtures`).
+    mod needs_host {
+        use super::*;
+        use crate::block_io::FileDevice;
+        use crate::fs::Filesystem;
+        use crate::inode::Inode;
+        use std::sync::Arc;
+
+        /// Real ext4-basic.img test: the root directory's inode has exactly one
+        /// leaf extent pointing at a single directory block. We verify the extent
+        /// layout and that reading the mapped physical block returns data that
+        /// parses as directory entries.
+        #[test]
+        fn ext4_basic_root_inode_has_extent() {
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let file = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev: Arc<dyn BlockDevice> = Arc::new(file);
+            let fs = Filesystem::mount(dev.clone()).expect("mount");
+            let raw = fs.read_inode_raw(2).expect("root inode"); // inode 2 = root dir
+            let inode = Inode::parse(&raw).expect("parse inode");
+
+            assert!(inode.is_dir(), "root inode is not a directory");
+            assert!(inode.has_extents(), "root inode does not use extents");
+
+            let header = ExtentHeader::parse(&inode.block).expect("parse extent header");
+            assert_eq!(header.magic, EXT4_EXT_MAGIC);
+            assert_eq!(header.depth, 0, "expected a leaf root for tiny test image");
+            assert!(header.entries >= 1);
+
+            let all = collect_all(&inode.block, dev.as_ref(), fs.sb.block_size())
+                .expect("collect extents");
+            assert!(!all.is_empty());
+            // First extent should start at logical block 0 for a small dir.
+            assert_eq!(all[0].logical_block, 0);
+            assert!(!all[0].uninitialized);
+
+            // Read the first physical block and verify it looks like a dir block
+            // (should have '.' as the first entry).
+            let first_phys = all[0].map(0);
+            let mut blk = vec![0u8; fs.sb.block_size() as usize];
+            dev.read_at(first_phys * fs.sb.block_size() as u64, &mut blk)
+                .unwrap();
+
+            let entries = crate::dir::parse_block(&blk, true).expect("parse dir block");
+            assert!(!entries.is_empty());
+            assert_eq!(entries[0].name, b".");
+        }
     }
 }

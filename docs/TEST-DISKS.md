@@ -4,6 +4,34 @@ Images under `test-disks/` exercise specific ext4 features. Each image has
 a sibling `.meta.txt` that documents its structure, so the fixtures are
 self-describing — no external key needed.
 
+Build them with `chore fixtures`. They need the real kernel's ext4 driver to
+populate (each image is formatted, loop-mounted and written through the
+kernel), so the recipes in `test-disks/guest-build-images.sh` run as root in
+the [fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness)
+VM, and `test-disks/build-fixtures.sh` moves the finished images into
+`test-disks/`. The same path runs everywhere: KVM on Linux, HVF on macOS, and
+the `fixtures` CI job, which hands the images to the test jobs on both
+architectures as an artifact. `test-disks/build-fixtures.sh htree xattr`
+rebuilds only some; `test-disks/build-fixtures.sh --check` lists what is
+missing.
+
+Every mkfs pins its UUID and directory hash seed, so each build has the same
+layout and checksum seeds; kernel-stamped times still differ between builds.
+A test never skips on a missing image: it fails naming `chore fixtures`.
+
+The same VM is where the ORACLE TOOLS live (`e2fsck`, `debugfs`,
+`dumpe2fs`, `tune2fs`, `mke2fs` — `scripts/vm-setup.sh` installs them) and
+where the KERNEL ORACLES mount: `chore test:kernel` loop-mounts an image
+this driver wrote and compares what Linux reads back with what was
+written. It is also where lwext4 is built (`scripts/vm-setup.sh`, at a
+pinned commit), which `chore test:lwext4` reads these same images with as
+a third opinion. Nothing of the sort happens on the host, on any
+platform. A test reaches a tool only through
+`fs_ext4_test_support::oracle`, the kernel only through the guest-kernel
+helpers and lwext4 only through the lwext4 helpers in the same crate; a scratch image
+therefore lives inside the repository (`./tmp`), which is the one part of
+the host the guest can see.
+
 | Image | Exercises |
 |---|---|
 | `ext4-basic.img` | minimal extent + dir entries |

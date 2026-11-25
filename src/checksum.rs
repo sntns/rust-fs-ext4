@@ -19,23 +19,86 @@
 //!   - [`Checksummer::seed`] — derived once at mount time
 //!   - [`Checksummer::superblock`], [`Checksummer::inode`], etc.
 //!
-//! Phase 1: read-only verification. We do NOT recompute checksums on writes
-//! (no writes yet). Verification is currently INFORMATIONAL — corrupt
-//! metadata would still parse; this module just lets callers decide whether
-//! to trust the result.
+//! Verification is enforced, not informational. A superblock or group
+//! descriptor whose checksum does not match aborts the mount with
+//! `Error::BadChecksum`, as does an inode read through
+//! `Filesystem::read_inode_verified`, and extent and directory blocks are
+//! checked as they are read. Every write recomputes the checksums of what it
+//! rewrites -- inodes in `finalize_inode_raw`, group descriptors and the
+//! superblock in `buffer_patch_bgd_counters` / `buffer_patch_sb_counters`,
+//! and the tails of directory and extent blocks -- so a new write path that
+//! rewrites a metadata block must recompute its checksum too (#90).
 
 use crate::features::{Incompat, RoCompat};
 use crate::superblock::Superblock;
 
-/// Linux-semantics CRC32C: no final XOR at either end. The `crc32c` crate's
-/// `crc32c_append(s, d)` is `~iterate(~s, d)`; the kernel's `__crc32c_le(c, d, l)`
-/// is `iterate(c, d)`. Wrap to get the kernel's semantics out of the crate.
+/// CRC32C as ext4 and JBD2 chain it: the seed goes in as the register
+/// value and nothing is inverted at either end. The `crc32c` crate's
+/// `crc32c_append(s, d)` is `~iterate(~s, d)`; the chaining form is
+/// `iterate(c, d)`. Wrap to get that form out of the crate.
 ///
 /// Public so write-path callers that rewrite a metadata block (dir, BGD, SB)
 /// can recompute the tail checksum inline without rebuilding a `Checksummer`.
 #[inline]
 pub fn linux_crc32c(seed: u32, data: &[u8]) -> u32 {
     !crc32c::crc32c_append(!seed, data)
+}
+
+/// CRC-16 with polynomial 0x8005, reflected, no final XOR (the parameters
+/// catalogued as CRC-16/ARC). Only `GDT_CSUM` group descriptors use it; the
+/// format documentation's checksum table names it as their `crc16`.
+pub fn crc16(mut crc: u16, data: &[u8]) -> u16 {
+    for &b in data {
+        crc ^= u16::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// The checksum group descriptor `group` must carry at 0x1E, or `None`
+/// when the volume asks for none.
+///
+/// The ingredients are the "Group Descriptors" row of the checksum table
+/// in the kernel.org ext4 format documentation. With `METADATA_CSUM` it is
+/// the low 16 bits of `crc32c(seed, group_le32 || desc)`. Otherwise, with
+/// `GDT_CSUM`, it is `crc16(~0, uuid || group_le32 || desc[..0x1E])`, plus
+/// the bytes past the checksum field only when `INCOMPAT_64BIT` is set.
+/// Either way the checksum field itself counts as zero. `desc` must hold
+/// at least `sb.desc_size` bytes; `None` is also returned when it doesn't.
+pub fn group_desc_csum(
+    sb: &Superblock,
+    csum: &Checksummer,
+    group: u32,
+    desc: &[u8],
+) -> Option<u16> {
+    let n = sb.desc_size as usize;
+    if desc.len() < n || n < 0x20 {
+        return None;
+    }
+    let le_group = group.to_le_bytes();
+    if sb.feature_ro_compat & RoCompat::METADATA_CSUM.bits() != 0 {
+        let mut c = linux_crc32c(csum.seed, &le_group);
+        c = linux_crc32c(c, &desc[..0x1E]);
+        c = linux_crc32c(c, &[0, 0]);
+        c = linux_crc32c(c, &desc[0x20..n]);
+        return Some(c as u16);
+    }
+    if sb.feature_ro_compat & RoCompat::GDT_CSUM.bits() == 0 {
+        return None;
+    }
+    let mut c = crc16(!0, &sb.uuid);
+    c = crc16(c, &le_group);
+    c = crc16(c, &desc[..0x1E]);
+    if sb.feature_incompat & Incompat::BIT64.bits() != 0 {
+        c = crc16(c, &desc[0x20..n]);
+    }
+    Some(c)
 }
 
 /// Per-mount checksum context: the seed and "is it enabled" flag.
@@ -45,12 +108,21 @@ pub struct Checksummer {
     pub enabled: bool,
 }
 
+/// `file_type` of the fake dirent that ends a checksummed directory
+/// block: the `det_reserved_ft` value the format documentation gives for
+/// `struct ext4_dir_entry_tail`.
+///
+/// Not a real file type: it is out of range for one, which is how a
+/// reader tells the tail apart from an entry.
+pub const DIR_ENTRY_TAIL_FILE_TYPE: u8 = 0xDE;
+
 impl Checksummer {
     /// Derive the checksum context from a parsed superblock.
     ///
     /// Per spec: if `INCOMPAT_CSUM_SEED` is set, use the explicit
-    /// `s_checksum_seed` field. Otherwise, the seed is the kernel's
-    /// `__crc32c_le(~0, UUID, 16)` — i.e. our `linux_crc32c(!0, UUID)`.
+    /// `s_checksum_seed` field. Otherwise, the seed is crc32c(~0, UUID)
+    /// (format documentation, `s_checksum_seed`) — i.e. our
+    /// `linux_crc32c(!0, UUID)`.
     pub fn from_superblock(sb: &Superblock) -> Self {
         let enabled = (sb.feature_ro_compat & RoCompat::METADATA_CSUM.bits()) != 0;
         let seed = if (sb.feature_incompat & Incompat::CSUM_SEED.bits()) != 0 {
@@ -123,8 +195,9 @@ impl Checksummer {
     /// `struct ext4_dir_entry_tail { u32 det_reserved_zero1; u16 det_rec_len;
     /// u8 det_reserved_zero2; u8 det_reserved_ft; u32 det_checksum; }`.
     ///
-    /// Per Linux `fs/ext4/dir.c::ext4_dirent_csum_set` the CRC covers
-    /// **`block[0..block_size - 12]`** — i.e. everything BEFORE the tail.
+    /// The format documentation's checksum table ("Directory Entries"): the
+    /// CRC covers **`block[0..block_size - 12]`** — i.e. everything BEFORE
+    /// the fake entry that holds it.
     /// The tail's own bytes (including `det_checksum`) are excluded:
     ///
     /// ```text
@@ -148,14 +221,117 @@ impl Checksummer {
         c == stored
     }
 
+    /// Plant the `ext4_dir_entry_tail` and checksum a directory block.
+    ///
+    /// The mirror of [`Self::verify_dir_entry_tail`], and the sibling
+    /// that was missing: `patch_extent_tail` and `patch_xattr_block`
+    /// both existed, so the one recipe written most often was the one
+    /// with no helper. It was hand-rolled at **sixteen** sites across
+    /// `fs.rs`, `fsck.rs`, `mkfs.rs` and the tests, in two different
+    /// addressing idioms (`bs - 12` with `+4/+6/+7`, and
+    /// `block.len()` with `-8/-6/-5`) that a reader has to prove
+    /// equivalent at each one.
+    ///
+    /// The tail is a **fake directory entry** occupying the last 12
+    /// bytes: `inode = 0` so no scan mistakes it for a real one,
+    /// `rec_len = 12` so a walk steps over it, `name_len = 0`, and
+    /// `file_type = 0xDE` as the marker `has_csum_tail` looks for. The
+    /// CRC then covers `block[..len - 12]` — the whole block *except*
+    /// the tail entry, which is what separates this from
+    /// [`Self::patch_extent_tail`], where only the trailing 4 bytes are
+    /// excluded.
+    ///
+    /// Planting is idempotent: a block that already carries the tail
+    /// gets the same twelve bytes back, so callers that only need the
+    /// checksum recomputed can use this too rather than keeping a
+    /// second recipe for that case.
+    ///
+    /// Every constant here has to agree with e2fsprogs, and a
+    /// disagreement produces no error until the volume is mounted
+    /// somewhere else — which is the argument for there being one copy
+    /// of them.
+    ///
+    /// No-op when checksums are disabled or the block is under 12
+    /// bytes; returns true when it patched.
+    pub fn patch_dir_entry_tail(&self, ino: u32, generation: u32, block: &mut [u8]) -> bool {
+        if !self.enabled || block.len() < 12 {
+            return false;
+        }
+        let end = block.len();
+        block[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes()); // inode = 0
+        block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
+        block[end - 6] = 0; // name_len
+        block[end - 5] = DIR_ENTRY_TAIL_FILE_TYPE;
+
+        let mut c = linux_crc32c(self.seed, &ino.to_le_bytes());
+        c = linux_crc32c(c, &generation.to_le_bytes());
+        c = linux_crc32c(c, &block[..end - 12]);
+        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+        true
+    }
+
+    /// Whether an htree block's `dx_tail` checksum is the one its contents
+    /// give: `Some(true)` or `Some(false)`, or `None` when checksums are off
+    /// or the count/limit pair leaves no room for a tail to check.
+    ///
+    /// The same computation as [`Checksummer::patch_dx_tail`], compared
+    /// rather than written.
+    pub fn verify_dx_tail(
+        &self,
+        ino: u32,
+        generation: u32,
+        block: &[u8],
+        count_offset: usize,
+    ) -> Option<bool> {
+        let mut copy = block.to_vec();
+        if !self.patch_dx_tail(ino, generation, &mut copy, count_offset) {
+            return None;
+        }
+        Some(copy == block)
+    }
+
+    /// Recompute the checksum in an htree block's `dx_tail`.
+    ///
+    /// The "HTREE Nodes" row of the format documentation's checksum table:
+    /// crc32c over the inode number and
+    /// generation, the block up to the last used `dx_entry`, and the tail's
+    /// reserved word, with the checksum field itself counted as zero. The
+    /// tail sits right after `limit` entries. `count_offset` is where the
+    /// count/limit pair starts: 32 in a `dx_root`, 8 in an interior node.
+    /// Returns `false` (and writes nothing) when checksums are off or the
+    /// count/limit pair does not leave room for a tail in this block.
+    pub fn patch_dx_tail(
+        &self,
+        ino: u32,
+        generation: u32,
+        block: &mut [u8],
+        count_offset: usize,
+    ) -> bool {
+        if !self.enabled || block.len() < count_offset + 4 {
+            return false;
+        }
+        let limit = u16::from_le_bytes([block[count_offset], block[count_offset + 1]]) as usize;
+        let count = u16::from_le_bytes([block[count_offset + 2], block[count_offset + 3]]) as usize;
+        let tail = count_offset + limit * 8;
+        if count > limit || tail + 8 > block.len() {
+            return false;
+        }
+        let mut c = linux_crc32c(self.seed, &ino.to_le_bytes());
+        c = linux_crc32c(c, &generation.to_le_bytes());
+        c = linux_crc32c(c, &block[..count_offset + count * 8]);
+        c = linux_crc32c(c, &block[tail..tail + 4]);
+        c = linux_crc32c(c, &[0; 4]);
+        block[tail + 4..tail + 8].copy_from_slice(&c.to_le_bytes());
+        true
+    }
+
     /// Verify an extent-block tail checksum.
     ///
     /// Extent index/leaf blocks (those read off-inode when the tree has
     /// internal nodes) end in a 4-byte `struct ext4_extent_tail
-    /// { u32 et_checksum; }`. Per Linux
-    /// `fs/ext4/extents.c::ext4_extent_block_csum_set` the CRC covers
-    /// **`block[0..len-4]`** — only the trailing `et_checksum` field is
-    /// excluded:
+    /// { u32 et_checksum; }`. Per the "Extents" row of the format
+    /// documentation's checksum table the CRC covers **`block[0..len-4]`**
+    /// — only the trailing `et_checksum` field is excluded:
     ///
     /// ```text
     ///   crc32c(seed, ino_le) → crc32c(., gen_le) → crc32c(., block[..len-4])
@@ -182,11 +358,28 @@ impl Checksummer {
     /// Verify a parsed inode's checksum.
     /// Chained: seed → ino_le → gen_le → inode_bytes (with checksum slots zeroed).
     pub fn verify_inode(&self, ino: u32, generation: u32, inode_raw: &[u8]) -> bool {
-        if !self.enabled || inode_raw.len() < 128 {
+        if !self.enabled {
             return true;
         }
+        // A truncated read is a refusal, not a pass — the same answer
+        // `verify_superblock`, `verify_dir_entry_tail` and
+        // `verify_extent_tail` give, and for the same reason: the
+        // caller got fewer bytes than it asked for, so a checksum
+        // computed here would cover bytes that are not the ones on
+        // disk. Reporting `true` says an inode verified when nothing
+        // verified it.
+        //
+        // This used to read `if !self.enabled || inode_raw.len() < 128`,
+        // one `||` instead of two `if`s — a difference invisible unless
+        // you read all four verifiers together.
+        if inode_raw.len() < crate::inode::GOOD_OLD_INODE_SIZE {
+            return false;
+        }
         let stored_lo = u16::from_le_bytes(inode_raw[0x7C..0x7E].try_into().unwrap()) as u32;
-        let stored_hi = if inode_raw.len() >= 0x84 {
+        // Only where `i_checksum_hi` exists. Below `i_extra_isize = 4` the
+        // bytes at 0x82 are ordinary inode bytes the checksum covers, and
+        // the kernel and libext2fs compare the low 16 bits alone (#380).
+        let stored_hi = if checksum_hi_fits(inode_raw) {
             u16::from_le_bytes(inode_raw[0x82..0x84].try_into().unwrap()) as u32
         } else {
             0
@@ -216,7 +409,10 @@ impl Checksummer {
 
     /// Verify an external xattr block's checksum.
     ///
-    /// Per Linux `fs/ext4/xattr.c::ext4_xattr_block_csum`, the recipe is:
+    /// The format documentation's checksum table gives the block with its
+    /// checksum field zeroed; the block number goes in ahead of it as well,
+    /// and blocks the kernel and e2fsprogs write verify this way. The
+    /// recipe is:
     ///
     /// ```text
     ///   crc32c(seed, block_nr_le_u64)
@@ -268,17 +464,18 @@ impl Checksummer {
         generation: u32,
         inode_raw: &[u8],
     ) -> Option<(u16, u16)> {
-        if !self.enabled || inode_raw.len() < 128 {
+        if !self.enabled || inode_raw.len() < crate::inode::GOOD_OLD_INODE_SIZE {
             return None;
         }
         // i_checksum_hi (0x82) is part of the checksum only when i_extra_isize
-        // (0x80) is large enough to cover it — the kernel's EXT4_FITS_IN_INODE
-        // test, which here means i_extra_isize >= 4. On a zeroed freed inode
+        // (0x80) is large enough to cover it: a field past the 128-byte base
+        // exists only if i_extra_isize reaches its end, which here means
+        // i_extra_isize >= 4 (the format documentation's inode table puts
+        // i_checksum_hi at 0x82). On a zeroed freed inode
         // (i_extra_isize = 0) the kernel uses ONLY the 16-bit lo checksum and
         // treats 0x82 as ordinary (zero) data; zeroing hi and storing a full
         // 32-bit value there mismatches ("checksum does not match inode").
-        let fits_hi = inode_raw.len() >= 0x84
-            && u16::from_le_bytes(inode_raw[0x80..0x82].try_into().unwrap()) >= 4;
+        let fits_hi = checksum_hi_fits(inode_raw);
         let mut tmp = inode_raw.to_vec();
         tmp[0x7C] = 0;
         tmp[0x7D] = 0;
@@ -297,10 +494,149 @@ impl Checksummer {
         };
         Some((lo, hi))
     }
+
+    /// Checksum `inode_raw` and store it: `i_checksum_lo` always, and
+    /// `i_checksum_hi` only where the inode has one.
+    ///
+    /// EVERY WRITER USED TO STORE BOTH HALVES. With `i_extra_isize < 4`
+    /// [`compute_inode_checksum`](Self::compute_inode_checksum) covers
+    /// 0x82..0x84 as ordinary bytes and returns a `hi` of 0, and storing
+    /// that 0 at 0x82 afterwards changed a byte the checksum had just
+    /// covered -- and on an inode whose in-inode xattr area was placed at
+    /// 0x80, erased the area's magic (#380). No-op when checksums are off.
+    pub(crate) fn patch_inode_checksum(&self, ino: u32, generation: u32, inode_raw: &mut [u8]) {
+        if let Some((lo, hi)) = self.compute_inode_checksum(ino, generation, inode_raw) {
+            inode_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+            if checksum_hi_fits(inode_raw) {
+                inode_raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Whether the inode has an `i_checksum_hi`: `i_extra_isize` (0x80) covers
+/// 0x82..0x84. A field in the extended part of the inode exists only when
+/// `i_extra_isize` reaches its end (format documentation, "Inode Size").
+fn checksum_hi_fits(inode_raw: &[u8]) -> bool {
+    inode_raw.len() >= 0x84 && u16::from_le_bytes(inode_raw[0x80..0x82].try_into().unwrap()) >= 4
 }
 
 #[cfg(test)]
 mod tests {
+
+    // --- a short buffer is a refusal, on every verifier ------------------
+    //
+    // Written before the fix. `verify_inode` passed a truncated buffer;
+    // its three siblings refused one. Nothing in the crate noticed the
+    // difference, because the short-buffer axis had no coverage at all.
+
+    /// A checksummer that is switched on, with an arbitrary seed.
+    fn enabled() -> Checksummer {
+        Checksummer {
+            enabled: true,
+            seed: 0xDEAD_BEEF,
+        }
+    }
+
+    /// Every verifier refuses a buffer too short to hold the field it
+    /// checks.
+    ///
+    /// This is a policy, not four separate decisions, and it is the
+    /// safe direction: a truncated read means the caller got less than
+    /// it asked for, and the checksum it would compute covers bytes
+    /// that are not the ones on disk. Returning `true` there reports a
+    /// structure as verified when nothing verified it.
+    ///
+    /// Asserted as a set so a fifth verifier cannot quietly pick the
+    /// other answer — which is exactly how `verify_inode` came to
+    /// differ from the other three.
+    #[test]
+    fn every_verifier_refuses_a_buffer_too_short_to_check() {
+        let c = enabled();
+        assert!(
+            !c.verify_superblock(&[0u8; 64]),
+            "superblock: a 64-byte buffer cannot hold a checksum at 0x3FC"
+        );
+        assert!(
+            !c.verify_dir_entry_tail(2, 0, &[0u8; 8]),
+            "dir entry tail: an 8-byte buffer cannot hold a 12-byte tail"
+        );
+        assert!(
+            !c.verify_extent_tail(2, 0, &[0u8; 2]),
+            "extent tail: a 2-byte buffer cannot hold a 4-byte checksum"
+        );
+        assert!(
+            !c.verify_inode(2, 0, &[0u8; 64]),
+            "inode: a 64-byte buffer cannot hold a checksum at 0x7C"
+        );
+    }
+
+    /// And every one of them still passes everything when checksums are
+    /// off, short buffer included.
+    ///
+    /// The two conditions are separate for a reason: "we do not check"
+    /// and "we checked and it failed" are different answers, and a
+    /// filesystem without `metadata_csum` must not start failing reads
+    /// because a buffer was short.
+    #[test]
+    fn a_disabled_checksummer_passes_even_a_short_buffer() {
+        let c = Checksummer {
+            enabled: false,
+            seed: 0,
+        };
+        assert!(c.verify_superblock(&[0u8; 4]));
+        assert!(c.verify_dir_entry_tail(2, 0, &[0u8; 4]));
+        assert!(c.verify_extent_tail(2, 0, &[0u8; 1]));
+        assert!(c.verify_inode(2, 0, &[0u8; 4]));
+    }
+
+    /// The boundary itself: 127 bytes is refused, 128 is checked.
+    ///
+    /// 128 is not where `verify_inode`'s own field ends — `i_checksum_lo`
+    /// sits at 0x7C..0x7E, so 126 bytes would hold it. It is the whole
+    /// fixed ext2 inode, every byte of which the checksum covers, so a
+    /// shorter buffer cannot be checked even when it holds the field.
+    #[test]
+    fn the_inode_length_boundary_is_the_whole_fixed_inode() {
+        let c = enabled();
+        assert!(!c.verify_inode(2, 0, &[0u8; 127]), "127 is too short");
+        // 128 bytes of zeros is a real check that simply fails: the
+        // stored checksum is zero and the computed one is not.
+        assert!(
+            !c.verify_inode(2, 0, &[0u8; 128]),
+            "128 is checked, and all-zero bytes do not verify"
+        );
+
+        // A 128-byte inode with a correct checksum verifies.
+        let mut raw: Vec<u8> = (0..128u32).map(|i| (i * 7 + 3) as u8).collect();
+        let (lo, _) = c.compute_inode_checksum(2, 5, &raw).unwrap();
+        raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+        assert!(c.verify_inode(2, 5, &raw), "a correct checksum verifies");
+
+        // The bytes past the field are covered: 0x7E..0x80 is after
+        // `i_checksum_lo` and still inside the fixed inode.
+        let mut past_the_field = raw.clone();
+        past_the_field[0x7F] ^= 0x01;
+        assert!(
+            !c.verify_inode(2, 5, &past_the_field),
+            "a byte after i_checksum_lo is part of the checksum"
+        );
+
+        // 126 bytes hold the field, and carry a checksum that is correct
+        // over those 126 bytes — and are still refused, because they are
+        // not the whole fixed inode the checksum is defined over.
+        let mut holds_the_field = raw[..0x7E].to_vec();
+        holds_the_field[0x7C..0x7E].fill(0);
+        let mut crc = linux_crc32c(c.seed, &2u32.to_le_bytes());
+        crc = linux_crc32c(crc, &5u32.to_le_bytes());
+        crc = linux_crc32c(crc, &holds_the_field);
+        holds_the_field[0x7C..0x7E].copy_from_slice(&(crc as u16).to_le_bytes());
+        assert!(
+            !c.verify_inode(2, 5, &holds_the_field),
+            "126 bytes hold i_checksum_lo and are still too short"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -419,206 +755,181 @@ mod tests {
         assert_ne!(p1, p2, "prefix changes hash");
     }
 
-    /// Verify our superblock-checksum routine against a real ext4-basic.img
-    /// (which has metadata_csum enabled).
-    #[test]
-    fn verifies_real_superblock() {
-        use crate::block_io::FileDevice;
+    /// Tests that read a fixture from `test-disks/` (`chore fixtures`).
+    mod needs_host {
+        use super::*;
 
-        let path = "test-disks/ext4-basic.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let sb = Superblock::read(&dev).expect("parse sb");
-        let csum = Checksummer::from_superblock(&sb);
-        if !csum.enabled {
-            eprintln!("skip: metadata_csum not enabled in ext4-basic.img");
-            return;
-        }
-        assert!(
-            csum.verify_superblock(&sb.raw),
-            "superblock checksum mismatch on {path}"
-        );
-    }
+        /// Verify our superblock-checksum routine against a real ext4-basic.img
+        /// (which has metadata_csum enabled).
+        #[test]
+        fn verifies_real_superblock() {
+            use crate::block_io::FileDevice;
 
-    /// Verify our BGD checksum against a real image — every group must pass.
-    #[test]
-    fn verifies_real_bgd() {
-        use crate::block_io::{BlockDevice, FileDevice};
-
-        let path = "test-disks/ext4-basic.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let sb = Superblock::read(&dev).expect("parse sb");
-        let csum = Checksummer::from_superblock(&sb);
-        if !csum.enabled {
-            eprintln!("skip: metadata_csum not enabled");
-            return;
-        }
-        // Read raw BGT and verify each descriptor.
-        let block_size = sb.block_size() as u64;
-        let bgt_off = (sb.first_data_block as u64 + 1) * block_size;
-        let group_count = sb.block_group_count();
-        let total = group_count as usize * sb.desc_size as usize;
-        let mut buf = vec![0u8; total];
-        dev.read_at(bgt_off, &mut buf).expect("read bgt");
-        for i in 0..group_count as usize {
-            let off = i * sb.desc_size as usize;
-            let raw = &buf[off..off + sb.desc_size as usize];
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let sb = Superblock::read(&dev).expect("parse sb");
+            let csum = Checksummer::from_superblock(&sb);
             assert!(
-                csum.verify_bgd(i as u32, raw, sb.desc_size),
-                "BGD {i} checksum mismatch on {path}"
+                csum.enabled,
+                "ext4-basic.img is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            assert!(
+                csum.verify_superblock(&sb.raw),
+                "superblock checksum mismatch on {path}"
             );
         }
-    }
 
-    /// Verify our inode checksum against a real image — root inode (2) must pass.
-    #[test]
-    fn verifies_real_inode() {
-        use crate::block_io::FileDevice;
-        use crate::fs::Filesystem;
-        use std::sync::Arc;
+        /// Verify our BGD checksum against a real image — every group must pass.
+        #[test]
+        fn verifies_real_bgd() {
+            use crate::block_io::{BlockDevice, FileDevice};
 
-        let path = "test-disks/ext4-basic.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let sb = Superblock::read(&dev).expect("parse sb");
+            let csum = Checksummer::from_superblock(&sb);
+            assert!(
+                csum.enabled,
+                "{path} is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            // Read raw BGT and verify each descriptor.
+            let block_size = sb.block_size() as u64;
+            let bgt_off = (sb.first_data_block as u64 + 1) * block_size;
+            let group_count = sb.block_group_count();
+            let total = group_count as usize * sb.desc_size as usize;
+            let mut buf = vec![0u8; total];
+            dev.read_at(bgt_off, &mut buf).expect("read bgt");
+            for i in 0..group_count as usize {
+                let off = i * sb.desc_size as usize;
+                let raw = &buf[off..off + sb.desc_size as usize];
+                assert!(
+                    csum.verify_bgd(i as u32, raw, sb.desc_size),
+                    "BGD {i} checksum mismatch on {path}"
+                );
             }
-        };
-        let dev_dyn: Arc<dyn crate::block_io::BlockDevice> = Arc::new(dev);
-        let fs = Filesystem::mount(dev_dyn).expect("mount");
-        if !fs.csum.enabled {
-            eprintln!("skip: metadata_csum not enabled");
-            return;
         }
-        // Inode 2 = root dir.
-        let (inode, raw) = fs.read_inode_verified(2).expect("read root inode");
-        assert!(inode.is_dir());
-        assert!(fs.csum.verify_inode(2, inode.generation, &raw));
-    }
 
-    /// Verify dir-block tail csum against a real image. Root dir on
-    /// ext4-basic.img is a single-block linear directory with a tail.
-    #[test]
-    fn verifies_real_dir_tail() {
-        use crate::block_io::{BlockDevice, FileDevice};
-        use crate::dir;
-        use crate::extent;
-        use crate::fs::Filesystem;
-        use std::sync::Arc;
+        /// Verify our inode checksum against a real image — root inode (2) must pass.
+        #[test]
+        fn verifies_real_inode() {
+            use crate::block_io::FileDevice;
+            use crate::fs::Filesystem;
+            use std::sync::Arc;
 
-        let path = "test-disks/ext4-basic.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev_dyn: Arc<dyn crate::block_io::BlockDevice> = Arc::new(dev);
+            let fs = Filesystem::mount(dev_dyn).expect("mount");
+            assert!(
+                fs.csum.enabled,
+                "{path} is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            // Inode 2 = root dir.
+            let (inode, raw) = fs.read_inode_verified(2).expect("read root inode");
+            assert!(inode.is_dir());
+            assert!(fs.csum.verify_inode(2, inode.generation, &raw));
+        }
+
+        /// Verify dir-block tail csum against a real image. Root dir on
+        /// ext4-basic.img is a single-block linear directory with a tail.
+        #[test]
+        fn verifies_real_dir_tail() {
+            use crate::block_io::{BlockDevice, FileDevice};
+            use crate::dir;
+            use crate::extent;
+            use crate::fs::Filesystem;
+            use std::sync::Arc;
+
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
+            let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
+            assert!(
+                fs.csum.enabled,
+                "{path} is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            let (root_inode, _raw) = fs.read_inode_verified(2).expect("root inode");
+            let bs = fs.sb.block_size();
+            let phys = extent::map_logical(&root_inode.block, dev_dyn.as_ref(), bs, 0)
+                .expect("map_logical")
+                .expect("dir block 0 mapped");
+            let mut block = vec![0u8; bs as usize];
+            dev_dyn.read_at(phys * bs as u64, &mut block).unwrap();
+            assert!(
+                dir::has_csum_tail(&block),
+                "expected tail on root dir block"
+            );
+            assert!(
+                fs.csum
+                    .verify_dir_entry_tail(2, root_inode.generation, &block),
+                "dir tail csum mismatch on {path} root dir"
+            );
+        }
+
+        /// Verify extent-block tail csum against ext4-deep-extents.img: any file
+        /// with depth > 0 has off-inode extent index/leaf blocks. We pick the
+        /// largest regular file and traverse one internal-node block.
+        #[test]
+        fn verifies_real_extent_tail() {
+            use crate::block_io::{BlockDevice, FileDevice};
+            use crate::extent::{self, ExtentHeader, ExtentIdx, EXT4_EXT_NODE_SIZE};
+            use crate::fs::Filesystem;
+            use std::sync::Arc;
+
+            let path =
+                fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-deep-extents.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
+            let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
+            assert!(
+                fs.csum.enabled,
+                "{path} is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            // Walk first ~50 inodes looking for one with depth>0.
+            let bs = fs.sb.block_size();
+            let mut found = None;
+            for ino in 11..200u32 {
+                let (inode, _raw) = match fs.read_inode_verified(ino) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                if !inode.is_file() || !inode.has_extents() {
+                    continue;
+                }
+                let header = match ExtentHeader::parse(&inode.block) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                if header.depth > 0 && header.entries >= 1 {
+                    let idx =
+                        ExtentIdx::parse(&inode.block[EXT4_EXT_NODE_SIZE..2 * EXT4_EXT_NODE_SIZE])
+                            .expect("parse first idx");
+                    found = Some((ino, inode.generation, idx.leaf_block));
+                    break;
+                }
             }
-        };
-        let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
-        let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
-        if !fs.csum.enabled {
-            eprintln!("skip: metadata_csum not enabled");
-            return;
-        }
-        let (root_inode, _raw) = fs.read_inode_verified(2).expect("root inode");
-        let bs = fs.sb.block_size();
-        let phys = extent::map_logical(&root_inode.block, dev_dyn.as_ref(), bs, 0)
-            .expect("map_logical")
-            .expect("dir block 0 mapped");
-        let mut block = vec![0u8; bs as usize];
-        dev_dyn.read_at(phys * bs as u64, &mut block).unwrap();
-        assert!(
-            dir::has_csum_tail(&block),
-            "expected tail on root dir block"
-        );
-        assert!(
-            fs.csum
-                .verify_dir_entry_tail(2, root_inode.generation, &block),
-            "dir tail csum mismatch on {path} root dir"
-        );
-    }
+            let (ino, gen, child_block) = found.unwrap_or_else(|| {
+                panic!(
+                    "no depth>0 inode in the first 200 of {path}: its sparse.bin is built \
+                 with a multi-level extent tree (test-disks/guest-build-images.sh)"
+                )
+            });
+            let mut buf = vec![0u8; bs as usize];
+            dev_dyn.read_at(child_block * bs as u64, &mut buf).unwrap();
+            assert!(
+                fs.csum.verify_extent_tail(ino, gen, &buf),
+                "extent block csum mismatch (ino={ino} child_block={child_block} on {path})"
+            );
 
-    /// Verify extent-block tail csum against ext4-deep-extents.img: any file
-    /// with depth > 0 has off-inode extent index/leaf blocks. We pick the
-    /// largest regular file and traverse one internal-node block.
-    #[test]
-    fn verifies_real_extent_tail() {
-        use crate::block_io::{BlockDevice, FileDevice};
-        use crate::extent::{self, ExtentHeader, ExtentIdx, EXT4_EXT_NODE_SIZE};
-        use crate::fs::Filesystem;
-        use std::sync::Arc;
-
-        let path = "test-disks/ext4-deep-extents.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
-        let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
-        if !fs.csum.enabled {
-            eprintln!("skip: metadata_csum not enabled");
-            return;
-        }
-        // Walk first ~50 inodes looking for one with depth>0.
-        let bs = fs.sb.block_size();
-        let mut found = None;
-        for ino in 11..200u32 {
-            let (inode, _raw) = match fs.read_inode_verified(ino) {
-                Ok(x) => x,
-                Err(_) => continue,
+            // Also exercise the verified traversal API end-to-end.
+            let (inode, _) = fs.read_inode_verified(ino).unwrap();
+            let ctx = extent::ExtentVerifyCtx {
+                ino,
+                generation: gen,
+                csum: &fs.csum,
             };
-            if !inode.is_file() || !inode.has_extents() {
-                continue;
-            }
-            let header = match ExtentHeader::parse(&inode.block) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            if header.depth > 0 && header.entries >= 1 {
-                let idx =
-                    ExtentIdx::parse(&inode.block[EXT4_EXT_NODE_SIZE..2 * EXT4_EXT_NODE_SIZE])
-                        .expect("parse first idx");
-                found = Some((ino, inode.generation, idx.leaf_block));
-                break;
-            }
+            let _ = extent::lookup_verified(&inode.block, dev_dyn.as_ref(), bs, 0, Some(&ctx))
+                .expect("lookup_verified must accept valid extent blocks");
         }
-        let (ino, gen, child_block) = match found {
-            Some(x) => x,
-            None => {
-                eprintln!("skip: no depth>0 inode in first 200 of {path}");
-                return;
-            }
-        };
-        let mut buf = vec![0u8; bs as usize];
-        dev_dyn.read_at(child_block * bs as u64, &mut buf).unwrap();
-        assert!(
-            fs.csum.verify_extent_tail(ino, gen, &buf),
-            "extent block csum mismatch (ino={ino} child_block={child_block} on {path})"
-        );
-
-        // Also exercise the verified traversal API end-to-end.
-        let (inode, _) = fs.read_inode_verified(ino).unwrap();
-        let ctx = extent::ExtentVerifyCtx {
-            ino,
-            generation: gen,
-            csum: &fs.csum,
-        };
-        let _ = extent::lookup_verified(&inode.block, dev_dyn.as_ref(), bs, 0, Some(&ctx))
-            .expect("lookup_verified must accept valid extent blocks");
     }
 }

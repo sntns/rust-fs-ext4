@@ -2,15 +2,17 @@
 //!
 //! Walks the on-disk journal starting at `jsb.start`, decodes descriptor /
 //! commit / revoke blocks, and yields a `ReplayPlan` describing what WOULD
-//! be written during replay. Phase 1: we never mutate the filesystem; the
-//! plan is just the evidence that replay is possible and correct. Phase 4
-//! will feed the plan into the write path wrapped in a real transaction.
+//! be written during replay. This module only reads; the plan goes to
+//! [`crate::journal_apply::apply`], which writes each block to its final
+//! location when a writable mount replays a dirty journal.
 //!
 //! All JBD2 on-disk data is **big-endian**. Journal block numbers are
 //! relative to the journal file (logical block 0 = superblock); the caller
 //! resolves them to physical fs blocks via [`jbd2::journal_block_to_physical`].
 //!
-//! Tag layout per `fs/jbd2/journal.c`:
+//! Tag layout per the "Descriptor Block" section of the kernel.org journal
+//! format documentation, confirmed against journals the kernel and
+//! e2fsprogs write:
 //!
 //! - **Classical tag** (JBD1 / no CSUM_V3): at least 8 bytes
 //!   - `__be32 t_blocknr`         (low 32 bits of fs block)
@@ -19,11 +21,14 @@
 //!   - `__be32 t_blocknr_high`    (iff INCOMPAT_BIT64)
 //!   - If `SAME_UUID` flag is not set, a 16-byte UUID follows inline.
 //!
+//!   - The tag is 12 bytes with BIT64 and 8 without, plus 2 with CSUM_V2.
+//!
 //! - **CSUM_V3 tag** (JBD2_FEATURE_INCOMPAT_CSUM_V3): 16 bytes
 //!   - `__be32 t_blocknr`
 //!   - `__be32 t_flags`
-//!   - `__be32 t_blocknr_high`    (iff INCOMPAT_BIT64; otherwise absent — tag is 12 bytes)
-//!   - `__be32 t_checksum`        (crc32c of header+uuid+block)
+//!   - `__be32 t_blocknr_high`    (iff INCOMPAT_BIT64; zero and still present otherwise)
+//!   - `__be32 t_checksum`        (crc32c of sequence+block)
+//!   - If `SAME_UUID` is not set, a 16-byte UUID follows, as in the classical layout.
 //!
 //! Tag flags:
 //!   - `0x1` ESCAPED   — block begins with JBD magic; first 4 bytes were zeroed during write
@@ -31,17 +36,34 @@
 //!   - `0x4` DELETED   — historical; not used in modern JBD2
 //!   - `0x8` LAST_TAG  — final tag in this descriptor block
 //!
-//! Commit block: just a `journal_header_t` (+ optional CSUM_V3 trailer we ignore).
+//! Commit block: a `journal_header_t`, with `h_chksum[0]` at offset 16 on a
+//! checksummed journal.
 //! Revoke block: `journal_header_t` + `__be32 r_count` + array of `__be32`/`__be64`
 //! fs block numbers (depending on INCOMPAT_BIT64); records blocks whose
 //! contents in earlier transactions should NOT be replayed.
+//!
+//! ### What is believed (#81)
+//!
+//! A transaction's writes and revokes join the plan only once its commit
+//! block has been read and, on a CSUM_V2/V3 journal, has passed its
+//! checksum. A commit block failing its checksum ends the log there: the
+//! format documentation says a transaction with no commit record, or one
+//! whose checksums do not match, is discarded during replay, and that is
+//! what a crash mid-commit leaves. A
+//! committed transaction -- one whose commit checks out -- with a
+//! descriptor, data or revoke block failing its checksum is corruption
+//! rather than a crash, and the walk refuses with [`Error::BadChecksum`]
+//! before anything is replayed. A journal declaring
+//! an incompat feature outside [`jbd2::SUPPORTED_JBD_INCOMPAT`], a checksum
+//! declaration JBD2 refuses, or a block size other than the filesystem's, is
+//! refused outright.
 
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use crate::inode::Inode;
 use crate::jbd2::{
-    self, JbdIncompat, JournalSuperblock, JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK,
-    JBD2_MAGIC_NUMBER, JBD2_REVOKE_BLOCK,
+    self, JournalSuperblock, JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK, JBD2_MAGIC_NUMBER,
+    JBD2_REVOKE_BLOCK,
 };
 
 /// Tag flag bits.
@@ -81,14 +103,16 @@ pub struct ReplayPlan {
     pub revokes: Vec<RevokeEntry>,
     /// Last committed transaction sequence seen.
     pub last_commit: u32,
+    /// Sequence to allocate after the last complete transaction (None if none).
+    pub next_sequence: Option<u32>,
     /// Number of journal blocks walked (for sanity / tests).
     pub blocks_walked: u64,
 }
 
 impl ReplayPlan {
     /// Apply revoke records to the write list: drop any write whose fs_block
-    /// was revoked by a later-or-equal transaction. This is what the kernel's
-    /// do_one_pass / scan_revoke_records does in spirit.
+    /// was revoked by a later-or-equal transaction: the rule the format
+    /// documentation gives for revoke blocks ("Revocation Block").
     pub fn filter_revoked(&mut self) {
         if self.revokes.is_empty() {
             return;
@@ -96,16 +120,22 @@ impl ReplayPlan {
         // For each fs_block, track the highest transaction seen in a revoke.
         let mut highest: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for r in &self.revokes {
-            let e = highest.entry(r.fs_block).or_insert(0);
-            if r.transaction > *e {
+            let e = highest.entry(r.fs_block).or_insert(r.transaction);
+            if sequence_after(r.transaction, *e) {
                 *e = r.transaction;
             }
         }
         self.writes.retain(|w| match highest.get(&w.fs_block) {
-            Some(&t) => w.transaction > t,
+            Some(&t) => sequence_after(w.transaction, t),
             None => true,
         });
     }
+}
+
+/// JBD2 transaction IDs wrap at u32, so they are compared in wrapping
+/// serial-number order (RFC 1982): by the sign of their wrapping difference.
+fn sequence_after(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
 }
 
 /// Walk the journal from `jsb.start` and build a [`ReplayPlan`].
@@ -120,16 +150,45 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
         return Ok(plan);
     }
 
+    if jsb.unsupported_incompat() != 0 {
+        return Err(Error::Unsupported(
+            "journal declares an incompat feature this driver cannot replay",
+        ));
+    }
+    if let Some(why) = jsb.checksum_declaration_error() {
+        return Err(Error::Corrupt(why));
+    }
+    if jsb.block_size != fs.sb.block_size() {
+        return Err(Error::Corrupt(
+            "journal block size differs from the filesystem's",
+        ));
+    }
+    if jsb.first == 0
+        || jsb.first >= jsb.max_len
+        || jsb.start < jsb.first
+        || jsb.start >= jsb.max_len
+    {
+        return Err(Error::Corrupt("invalid journal geometry"));
+    }
+
     let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
     let jinode = Inode::parse(&raw)?;
     let block_size = jsb.block_size as u64;
     let mut cur = jsb.start as u64;
     let mut expect_seq = jsb.sequence;
+    let seed = jsb.uses_csum_v2_or_v3().then(|| jsb.csum_seed());
+    // The open transaction's writes and revokes, moved into the plan only
+    // when its commit block checks out. A data or revoke block failing its
+    // checksum is judged at the commit: in a transaction the crash tore it
+    // is only the end of the log; in a committed one it is corruption.
+    let mut pending = ReplayPlan::default();
+    let mut pending_corrupt: Option<&'static str> = None;
 
-    // Upper bound: never scan more than the whole journal once. A real
+    // Upper bound: never scan more than the whole ring once, counting the
+    // descriptor payload blocks as well as the metadata blocks. A real
     // replay follows a circular log; here we stop when a block header does
     // not match the expected pattern or when we hit the sb block (0).
-    let limit = jsb.max_len as u64;
+    let limit = u64::from(jsb.max_len - jsb.first);
 
     while plan.blocks_walked < limit {
         let block_buf = read_journal_block(fs, &jinode, cur, block_size)?;
@@ -150,16 +209,67 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
 
         match hdr.block_type {
             JBD2_DESCRIPTOR_BLOCK => {
-                let tag_writes = parse_descriptor_tags(&block_buf, &mut cur, jsb, expect_seq)?;
-                plan.writes.extend(tag_writes);
+                // A descriptor failing its checksum is judged at the commit,
+                // as the kernel's journal recovery judges it: with no
+                // valid commit after it, a crash tore the transaction and the
+                // log ends; with one, the log is corrupt. Its tags still say
+                // how many data blocks to step over, if they parse at all.
+                let torn = seed.is_some_and(|seed| !tail_checksum_matches(seed, &block_buf));
+                let tags = match parse_descriptor_tags(&block_buf, &mut cur, jsb, expect_seq) {
+                    Ok(tags) => tags,
+                    Err(_) if torn => break,
+                    Err(e) => return Err(e),
+                };
+                if torn {
+                    pending_corrupt = Some("journal descriptor block of a committed transaction");
+                }
+                plan.blocks_walked += tags.len() as u64;
+                if plan.blocks_walked > limit {
+                    return Err(Error::Corrupt("journal transaction exceeds ring"));
+                }
+                for (entry, stored) in tags {
+                    if let Some(seed) = seed {
+                        let data =
+                            read_journal_block(fs, &jinode, entry.journal_block, block_size)?;
+                        let computed = jbd2::tag_checksum(seed, expect_seq, &data);
+                        let computed = if jsb.uses_csum_v3() {
+                            computed
+                        } else {
+                            computed & 0xFFFF
+                        };
+                        if computed != stored {
+                            pending_corrupt = Some("journal data block of a committed transaction");
+                        }
+                    }
+                    pending.writes.push(entry);
+                }
             }
             JBD2_COMMIT_BLOCK => {
+                if let Some(seed) = seed {
+                    let stored = u32::from_be_bytes(
+                        block_buf[jbd2::COMMIT_CHECKSUM_AT..jbd2::COMMIT_CHECKSUM_AT + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    if jbd2::commit_block_checksum(seed, &block_buf) != stored {
+                        break;
+                    }
+                }
+                if let Some(what) = pending_corrupt {
+                    return Err(Error::BadChecksum { what });
+                }
+                plan.writes.append(&mut pending.writes);
+                plan.revokes.append(&mut pending.revokes);
                 plan.last_commit = expect_seq;
                 expect_seq = expect_seq.wrapping_add(1);
+                plan.next_sequence = Some(expect_seq);
             }
             JBD2_REVOKE_BLOCK => {
+                if seed.is_some_and(|seed| !tail_checksum_matches(seed, &block_buf)) {
+                    pending_corrupt = Some("journal revoke block of a committed transaction");
+                }
                 let revokes = parse_revoke_block(&block_buf, jsb, expect_seq)?;
-                plan.revokes.extend(revokes);
+                pending.revokes.extend(revokes);
             }
             _ => break,
         }
@@ -190,6 +300,13 @@ fn advance(cur: u64, n: u64, jsb: &JournalSuperblock) -> u64 {
 struct JournalHeader {
     block_type: u32,
     sequence: u32,
+}
+
+/// Whether a descriptor or revoke block's four-byte tail holds its checksum.
+fn tail_checksum_matches(seed: u32, block: &[u8]) -> bool {
+    let at = block.len() - jbd2::BLOCK_TAIL_BYTES;
+    let stored = u32::from_be_bytes(block[at..].try_into().unwrap());
+    jbd2::block_tail_checksum(seed, block) == stored
 }
 
 fn try_parse_header(block: &[u8]) -> Option<JournalHeader> {
@@ -223,54 +340,52 @@ fn read_journal_block(
 
 /// Parse the tag array that follows a descriptor header. Each tag names one
 /// data block that will appear next in the journal. Advances `cur` past those
-/// data blocks (they are consumed, not walked for JBD2 headers).
+/// data blocks (they are consumed, not walked for JBD2 headers). Each entry
+/// comes with the tag's stored checksum: all 32 bits of a CSUM_V3 tag, the
+/// 16 of a classical one.
 fn parse_descriptor_tags(
     block: &[u8],
     cur: &mut u64,
     jsb: &JournalSuperblock,
     transaction: u32,
-) -> Result<Vec<ReplayEntry>> {
+) -> Result<Vec<(ReplayEntry, u32)>> {
     let mut out = Vec::new();
     let uses_64bit = jsb.uses_64bit();
-    let uses_v3 = jsb.feature_incompat & JbdIncompat::CSUM_V3.bits() != 0;
+    let uses_v3 = jsb.uses_csum_v3();
+    let tag_size = jsb.tag_bytes();
+    // A checksummed journal keeps the last four bytes for the block's tail.
+    let usable = if jsb.uses_csum_v2_or_v3() {
+        block.len() - jbd2::BLOCK_TAIL_BYTES
+    } else {
+        block.len()
+    };
 
     let mut pos = 12usize; // skip header
     loop {
-        let tag_size = if uses_v3 {
-            if uses_64bit {
-                16
-            } else {
-                12
-            }
-        } else if uses_64bit {
-            12
-        } else {
-            8
-        };
-        if pos + tag_size > block.len() {
+        if pos + tag_size > usable {
             return Err(Error::Corrupt("descriptor tag overruns block"));
         }
 
         let blocknr_lo = u32::from_be_bytes(block[pos..pos + 4].try_into().unwrap());
 
-        let (flags, blocknr_high_off, uuid_follows_size) = if uses_v3 {
-            let flags = u32::from_be_bytes(block[pos + 4..pos + 8].try_into().unwrap());
-            // CSUM_V3: flags is a full 32-bit field. Inline UUID doesn't exist
-            // in v3 (uuid is in the checksum computation only).
-            (flags, 8usize, 0usize)
+        let (flags, checksum) = if uses_v3 {
+            (
+                u32::from_be_bytes(block[pos + 4..pos + 8].try_into().unwrap()),
+                u32::from_be_bytes(block[pos + 12..pos + 16].try_into().unwrap()),
+            )
         } else {
             // Classic: __be16 t_checksum + __be16 t_flags at offset 4
-            let flags16 = u16::from_be_bytes(block[pos + 6..pos + 8].try_into().unwrap()) as u32;
-            let uuid_size = if flags16 & TAG_SAME_UUID != 0 { 0 } else { 16 };
-            (flags16, 8usize, uuid_size)
+            (
+                u16::from_be_bytes(block[pos + 6..pos + 8].try_into().unwrap()) as u32,
+                u16::from_be_bytes(block[pos + 4..pos + 6].try_into().unwrap()) as u32,
+            )
         };
+        // Every layout carries the UUID inline unless the tag says it is the
+        // previous one's.
+        let uuid_follows_size = if flags & TAG_SAME_UUID != 0 { 0 } else { 16 };
 
         let blocknr = if uses_64bit {
-            let hi = u32::from_be_bytes(
-                block[pos + blocknr_high_off..pos + blocknr_high_off + 4]
-                    .try_into()
-                    .unwrap(),
-            );
+            let hi = u32::from_be_bytes(block[pos + 8..pos + 12].try_into().unwrap());
             ((hi as u64) << 32) | (blocknr_lo as u64)
         } else {
             blocknr_lo as u64
@@ -280,19 +395,22 @@ fn parse_descriptor_tags(
         *cur = advance(*cur, 1, jsb);
         let data_journal_block = *cur;
 
-        out.push(ReplayEntry {
-            transaction,
-            fs_block: blocknr,
-            journal_block: data_journal_block,
-            flags,
-        });
+        out.push((
+            ReplayEntry {
+                transaction,
+                fs_block: blocknr,
+                journal_block: data_journal_block,
+                flags,
+            },
+            checksum,
+        ));
 
         pos += tag_size + uuid_follows_size;
 
         if flags & TAG_LAST != 0 {
             break;
         }
-        if pos + 8 > block.len() {
+        if pos + tag_size > usable {
             // Ran off the end without a LAST_TAG — descriptor is full.
             break;
         }
@@ -311,9 +429,22 @@ fn parse_revoke_block(
     }
     let r_count = u32::from_be_bytes(block[12..16].try_into().unwrap()) as usize;
     let record_size = if jsb.uses_64bit() { 8 } else { 4 };
+    // `r_count` is bounded by the block less its `r_checksum` tail, never
+    // clamped to it: a larger count is corrupt (e2fsck refuses it too), and
+    // reading on would take the checksum for a record (#301).
+    let usable = if jsb.uses_csum_v2_or_v3() {
+        block.len() - jbd2::BLOCK_TAIL_BYTES
+    } else {
+        block.len()
+    };
+    if r_count > usable {
+        return Err(Error::Corrupt(
+            "journal revoke block count exceeds the block",
+        ));
+    }
     let mut out = Vec::new();
     let mut pos = 16usize;
-    let end = r_count.min(block.len());
+    let end = r_count;
     while pos + record_size <= end {
         let fs_block = if jsb.uses_64bit() {
             u64::from_be_bytes(block[pos..pos + 8].try_into().unwrap())
@@ -362,6 +493,40 @@ mod tests {
     }
 
     #[test]
+    fn revoke_order_wraps_like_jbd2_transaction_ids() {
+        let mut plan = ReplayPlan {
+            writes: vec![
+                ReplayEntry {
+                    transaction: u32::MAX,
+                    fs_block: 3,
+                    journal_block: 1,
+                    flags: 0,
+                },
+                ReplayEntry {
+                    transaction: 1,
+                    fs_block: 3,
+                    journal_block: 2,
+                    flags: 0,
+                },
+            ],
+            revokes: vec![
+                RevokeEntry {
+                    transaction: u32::MAX - 1,
+                    fs_block: 3,
+                },
+                RevokeEntry {
+                    transaction: 0,
+                    fs_block: 3,
+                },
+            ],
+            ..Default::default()
+        };
+        plan.filter_revoked();
+        assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.writes[0].transaction, 1);
+    }
+
+    #[test]
     fn revoke_records_scale_with_r_count() {
         let jsb = mk_jsb(JbdIncompat::REVOKE.bits(), 128);
         let mut blk = vec![0u8; 4096];
@@ -375,6 +540,86 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].fs_block, 100);
         assert_eq!(out[2].fs_block, 300);
+    }
+
+    /// A revoke block claiming more bytes than it may hold, for a journal
+    /// with `incompat` and a planned write to `fs_block` at `tail_at`.
+    fn revoke_block_overrunning_its_records(
+        r_count: u32,
+        tail_at: usize,
+        fs_block: u32,
+    ) -> Vec<u8> {
+        let mut blk = vec![0u8; 4096];
+        header(&mut blk, JBD2_REVOKE_BLOCK, 10);
+        blk[12..16].copy_from_slice(&r_count.to_be_bytes());
+        blk[16..20].copy_from_slice(&100u32.to_be_bytes());
+        blk[tail_at..tail_at + 4].copy_from_slice(&fs_block.to_be_bytes());
+        blk
+    }
+
+    /// On a CSUM_V3 journal the last four bytes are `r_checksum`, not a
+    /// record: an `r_count` reaching into them is refused, as e2fsck refuses
+    /// it, rather than letting the checksum
+    /// revoke a committed write (#301).
+    #[test]
+    fn a_csum_v3_revoke_count_reaching_the_tail_is_refused() {
+        let jsb = mk_jsb(
+            JbdIncompat::REVOKE.bits() | JbdIncompat::CSUM_V3.bits(),
+            128,
+        );
+        let blk = revoke_block_overrunning_its_records(4096, 4096 - jbd2::BLOCK_TAIL_BYTES, 9000);
+        let parsed = parse_revoke_block(&blk, &jsb, 10);
+        let mut plan = ReplayPlan {
+            writes: vec![ReplayEntry {
+                transaction: 10,
+                fs_block: 9000,
+                journal_block: 2,
+                flags: 0,
+            }],
+            revokes: parsed.as_ref().map(Vec::clone).unwrap_or_default(),
+            ..Default::default()
+        };
+        plan.filter_revoked();
+        assert!(
+            matches!(parsed, Err(Error::Corrupt(_))),
+            "r_count covering the checksum tail parsed as {} records; writes left in the plan: {}",
+            parsed.map(|r| r.len()).unwrap_or_default(),
+            plan.writes.len()
+        );
+    }
+
+    /// The same bound with the tail counted: `r_count` up to the tail is
+    /// every record the block holds.
+    #[test]
+    fn a_csum_v3_revoke_count_up_to_the_tail_is_read() {
+        let jsb = mk_jsb(
+            JbdIncompat::REVOKE.bits() | JbdIncompat::CSUM_V3.bits(),
+            128,
+        );
+        let usable = 4096 - jbd2::BLOCK_TAIL_BYTES;
+        let blk = revoke_block_overrunning_its_records(usable as u32, usable - 4, 9000);
+        let out = parse_revoke_block(&blk, &jsb, 10).unwrap();
+        assert_eq!(out.len(), (usable - 16) / 4);
+        assert_eq!(out[0].fs_block, 100);
+        assert_eq!(out.last().unwrap().fs_block, 9000);
+    }
+
+    /// Without checksums a count past the block is refused, not clamped.
+    #[test]
+    fn a_revoke_count_past_the_block_is_refused() {
+        let jsb = mk_jsb(JbdIncompat::REVOKE.bits(), 128);
+        let blk = revoke_block_overrunning_its_records(4097, 4092, 9000);
+        let parsed = parse_revoke_block(&blk, &jsb, 10);
+        assert!(
+            matches!(parsed, Err(Error::Corrupt(_))),
+            "r_count past the block parsed as {} records",
+            parsed.map(|r| r.len()).unwrap_or_default()
+        );
+        // A count exactly the block is every record in it.
+        let blk = revoke_block_overrunning_its_records(4096, 4092, 9000);
+        let out = parse_revoke_block(&blk, &jsb, 10).unwrap();
+        assert_eq!(out.len(), (4096 - 16) / 4);
+        assert_eq!(out.last().unwrap().fs_block, 9000);
     }
 
     #[test]
@@ -432,9 +677,41 @@ mod tests {
         let mut cur = 1u64;
         let out = parse_descriptor_tags(&blk, &mut cur, &jsb, 10).unwrap();
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].fs_block, 1000);
-        assert_eq!(out[1].fs_block, 2000);
-        assert_eq!(out[1].flags & TAG_LAST, TAG_LAST);
+        assert_eq!(out[0].0.fs_block, 1000);
+        assert_eq!(out[1].0.fs_block, 2000);
+        assert_eq!(out[1].0.flags & TAG_LAST, TAG_LAST);
+    }
+
+    /// A CSUM_V3 tag is 16 bytes without BIT64 too, and a UUID follows one
+    /// without SAME_UUID -- `debugfs` writes exactly that first tag.
+    #[test]
+    fn parse_v3_tags_without_bit64_skip_the_uuid() {
+        let jsb = mk_jsb(JbdIncompat::CSUM_V3.bits(), 128);
+        let mut blk = vec![0u8; 4096];
+        header(&mut blk, JBD2_DESCRIPTOR_BLOCK, 10);
+        blk[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        blk[24..28].copy_from_slice(&0xAABB_CCDDu32.to_be_bytes()); // t_checksum
+        blk[28..44].fill(0xEE); // uuid
+        blk[44..48].copy_from_slice(&2000u32.to_be_bytes());
+        blk[48..52].copy_from_slice(&(TAG_SAME_UUID | TAG_LAST).to_be_bytes());
+
+        let mut cur = 1u64;
+        let out = parse_descriptor_tags(&blk, &mut cur, &jsb, 10).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0],
+            (
+                ReplayEntry {
+                    transaction: 10,
+                    fs_block: 1000,
+                    journal_block: 2,
+                    flags: 0
+                },
+                0xAABB_CCDD
+            )
+        );
+        assert_eq!(out[1].0.fs_block, 2000);
+        assert_eq!(out[1].0.journal_block, 3);
     }
 
     #[test]
